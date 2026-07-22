@@ -235,12 +235,13 @@ async function inspectPlatform() {
   }
   const chapterNos = (all.result.chapters || []).map((item) => item.chapter_no);
   state.localChapterCount = chapterNos.length;
-  setStatus("正在刷新番茄状态…", "只读取章节列表，不会修改页面。", "neutral");
+  setStatus("正在打开目标作品…", "插件会进入标准章节管理页并读取列表，不会修改或发布章节。", "neutral");
   const response = await send({ type: "inspectPlatform", bookId, chapterNos });
   button.disabled = false;
   if (!response.ok) {
-    setStatus("无法读取当前页面", "请打开这个作品的章节管理页后再点刷新。", "warn");
-    setActionResult(response.error, "warn");
+    const message = friendlyError(response.error);
+    setStatus("番茄状态刷新失败", message, "warn");
+    setActionResult(message, "warn");
     return null;
   }
   state.platformSnapshot = response.result.snapshot;
@@ -318,12 +319,8 @@ async function createPlan() {
 async function smartRunNext() {
   const button = $("smartRunNext");
   button.disabled = true;
-  const page = await send({ type: "inspectActivePage" });
-  if (!page.ok || page.result?.state !== "writer") {
-    button.disabled = false;
-    setStatus("请先打开章节管理页", "打开当前作品的章节管理列表，再点击“自动处理下一章”。", "warn");
-    return;
-  }
+  // 主流程只保留一个入口：先自动打开并刷新已绑定作品，再处理下一章。
+  // 用户无需自己切换到“我的小说”或章节管理页。
   const refreshed = await inspectPlatform();
   if (!refreshed) { button.disabled = false; return; }
   await prepareAndRun(null);
@@ -362,13 +359,11 @@ async function smartProcessSelected() {
     setActionResult(`第 ${chapter.chapter_no} 章在番茄已有记录，无需重复处理。`, "ok");
     return;
   }
-  // When invoked from the management list, refresh first so a chapter manually
-  // submitted moments ago is reserved instead of being created again.
-  const page = await send({ type: "inspectActivePage" });
-  if (page.ok && page.result?.state === "writer") {
-    const refreshed = await inspectPlatform();
-    if (!refreshed) return;
-  }
+  // Always establish one fresh platform preflight before creating a chapter. Refresh
+  // lands on the bound work's canonical chapter-management URL and the following action
+  // reuses that result instead of repeating login/navigation checks.
+  const refreshed = await inspectPlatform();
+  if (!refreshed) return;
   await prepareAndRun(chapter.chapter_no);
 }
 
@@ -383,7 +378,7 @@ async function prepareAndRun(chapterNo) {
     const detail = await send({ type: "getChapter", bookId: $("bookSelect").value, chapterNo: blocker.chapter_no });
     if (detail.ok && detail.result?.recovery?.allowed) {
       primaryButton.disabled = false;
-      await recoverBlockedChapter(blocker.chapter_no, { rerun: true });
+      await recoverBlockedChapter(blocker.chapter_no, { rerun: true, platformSnapshot: state.platformSnapshot });
       return;
     }
     const instruction = blockerInstruction(blocker);
@@ -452,7 +447,7 @@ async function resumeBlockedSelected() {
   await recoverBlockedChapter(state.selected.chapter_no, { rerun: false });
 }
 
-async function recoverBlockedChapter(chapterNo, { rerun = false } = {}) {
+async function recoverBlockedChapter(chapterNo, { rerun = false, platformSnapshot = null } = {}) {
   const bookId = $("bookSelect").value;
   const detail = await send({ type: "getChapter", bookId, chapterNo });
   if (!detail.ok) return setStatus("章节读取失败", detail.error, "danger");
@@ -465,17 +460,25 @@ async function recoverBlockedChapter(chapterNo, { rerun = false } = {}) {
     return setStatus("不能直接重试", message, "warn");
   }
 
-  setStatus("正在确认番茄没有这一章…", "只读取章节管理列表，不会修改页面。", "neutral");
-  const checked = await send({ type: "inspectPlatform", bookId, chapterNos: [chapterNo] });
-  if (!checked.ok) return setStatus("无法确认平台状态", "请打开当前作品的章节管理页后再试。", "warn");
-  const row = (checked.result.snapshot.rows || []).find((entry) => Number(entry.chapterNo) === Number(chapterNo));
+  let snapshot = platformSnapshot;
+  if (!snapshot) {
+    setStatus("正在确认番茄没有这一章…", "正在自动打开目标作品的章节管理页，只读取列表。", "neutral");
+    const checked = await send({ type: "inspectPlatform", bookId, chapterNos: [chapterNo] });
+    if (!checked.ok) return setStatus("无法确认平台状态", friendlyError(checked.error), "warn");
+    snapshot = checked.result.snapshot;
+  }
+  const row = (snapshot.rows || []).find((entry) => Number(entry.chapterNo) === Number(chapterNo));
   if (row?.found) {
     await connectAndLoad();
     setActionResult(`番茄已经存在第 ${chapterNo} 章，插件不会重复创建。`, "warn");
     return setStatus("平台已有该章", "请打开这一章核对正文或定时状态。", "warn");
   }
 
-  const confirmed = window.confirm(
+  // A click on “自动处理下一章” plus the fresh snapshot is already an explicit
+  // user-authorized retry. Do not ask the same question a second time. Advanced/manual
+  // recovery still keeps the confirmation dialog when it did not inherit that snapshot.
+  const explicitlyAuthorized = Boolean(rerun && platformSnapshot);
+  const confirmed = explicitlyAuthorized || window.confirm(
     `番茄章节管理列表中没有第 ${chapterNo} 章，而且这次没有执行最终提交。\n\n点击“确定”后，插件会清除这次未完成记录并重新处理本章。`
   );
   if (!confirmed) return setStatus("没有重试", "未修改本地账本和番茄页面。", "warn");
@@ -484,7 +487,7 @@ async function recoverBlockedChapter(chapterNo, { rerun = false } = {}) {
     bookId,
     chapterNo,
     textSha256: chapter.text_sha256,
-    evidenceUrl: checked.result.snapshot.url || null
+    evidenceUrl: snapshot.url || null
   });
   if (!recovered.ok) {
     const message = friendlyError(recovered.error);
@@ -502,7 +505,7 @@ async function recoverBlockedChapter(chapterNo, { rerun = false } = {}) {
 async function runAutomation(item) {
   if (!state.currentPlan || state.currentPlan.status !== "approved") return setActionResult("请先批准发布计划。", "warn");
   setStatus(`正在自动处理第 ${item.chapter_no} 章…`, `计划 ${item.publication_date} ${item.publication_time}，Edge 将执行并回读平台状态。`, "neutral");
-  setActionResult("正在检查登录、作品、编辑器和发布设置，请不要手动点击页面。", "neutral");
+  setActionResult(`正在处理第 ${item.chapter_no} 章：已完成作品预检，正在打开编辑页、填充并点击“下一步”。`, "neutral");
   const continuingAiChoice = item.status === "awaiting_ai_choice";
   const response = await send({
     type: continuingAiChoice ? "continueManualAi" : "automateChapter",

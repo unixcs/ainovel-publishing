@@ -1,5 +1,7 @@
 "use strict";
 
+const PAGE_ADAPTER_VERSION = "0.3.2";
+
 // Selector strategy adapted from NonoOi/fanqie-author-injector (MIT); see THIRD_PARTY_NOTICES.md.
 const FIELD_SELECTORS = {
   chapterNumber: [
@@ -50,7 +52,8 @@ const PAGE_ACTIONS = new Set([
   "clickNext",
   "completePublicationFlow",
   "submitPreparedPublication",
-  "inspectPublicationList"
+  "inspectPublicationList",
+  "inspectWorks"
 ]);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -80,6 +83,8 @@ async function dispatchPageAction(message) {
       return submitPreparedPublication(message.options || {});
     case "inspectPublicationList":
       return inspectPublicationList(message.chapterNos || []);
+    case "inspectWorks":
+      return inspectWorks(message.bookName || null);
     default:
       return failure("不支持的页面操作。", "unsupported_page_action");
   }
@@ -411,7 +416,7 @@ function inspectPage(expectedBookName = null, expectedWorkId = null) {
   const loginRequired = isLoginPage(body);
   const publishSettings = hasPublicationSettings(body);
   const typoPrompt = Boolean(findTypoDialog());
-  const fullCheckReady = Boolean(findActionButton(["全面检测"]).element);
+  const fullCheckReady = Boolean(findActionButton(["全面检测", "全文检测"]).element);
   const publicationFlowReady = publishSettings || typoPrompt || fullCheckReady;
   const editor = Boolean(fields.titleField && fields.editor);
   const writer = isWriterPage(body);
@@ -426,6 +431,7 @@ function inspectPage(expectedBookName = null, expectedWorkId = null) {
     : (!expectedBookName || normalizeCompact(body).includes(normalizeCompact(expectedBookName)));
   return {
     ok: state !== "unknown",
+    adapterVersion: PAGE_ADAPTER_VERSION,
     state,
     url: location.href,
     title: document.title,
@@ -475,39 +481,84 @@ async function clickNext(chapter) {
       });
     }
   }
-  const found = findActionButton(["下一步"]);
-  if (!found.element) return failure("没有找到可验证的“下一步”按钮。", "next_button_missing", { candidates: found.candidates });
+
+  // “下一步”是一次不可随意猜测的页面操作。只接受真正的 button 或
+  // role=button，文字必须完全相等，并选择页面最下方的有效候选。旧版把普通
+  // div 也当按钮，可能点中新手引导或外层容器，导致编辑器被重挂载/清空。
+  const before = captureTransitionDiagnostics();
+  const found = findStrictNextButton();
+  if (!found.element) {
+    return failure("没有找到唯一可验证的“下一步”按钮，已停止且未操作页面。", "next_button_missing", {
+      candidates: found.candidates,
+      diagnostics: before
+    });
+  }
+  const selected = describeActionElement(found.element);
   clickVisible(found.element);
-  return { ok: true, code: "next_clicked", candidates: found.candidates };
+  // 让同步的弹窗、SPA 路由或编辑器重挂载先发生，留下可核对的前后证据。
+  await sleep(150);
+  const after = captureTransitionDiagnostics(before);
+  return {
+    ok: true,
+    code: "next_clicked",
+    selected,
+    candidates: found.candidates,
+    transition: { before, after }
+  };
 }
 
 async function completePublicationFlow(options) {
-  const deadline = Date.now() + AUTOMATION_LIMITS.transitionMs;
-  const transition = await waitFor(() => {
-    const riskDialog = findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu);
-    if (riskDialog) return { blocked: true };
-    const typoDialog = findTypoDialog();
-    if (typoDialog) return { value: { kind: "typo", root: typoDialog } };
-    if (findActionButton(["全面检测"]).element || hasPublicationSettings(visiblePageText())) {
-      return { value: { kind: "ready" } };
-    }
-    return false;
-  }, deadline);
-  if (transition.blocked) return failure("检测到风险控制或验证码页面，必须人工处理。", "risk_control_detected");
-  if (!transition.value) return failure("下一步后未识别到错别字提示、全面检测或发布设置。", "post_next_state_unknown");
+  const requestedTimeout = Number(options.transitionTimeoutMs || AUTOMATION_LIMITS.transitionMs);
+  const transitionTimeoutMs = Number.isFinite(requestedTimeout)
+    ? Math.min(Math.max(requestedTimeout, 100), AUTOMATION_LIMITS.transitionMs)
+    : AUTOMATION_LIMITS.transitionMs;
+  const deadline = Date.now() + transitionTimeoutMs;
+  const transition = await waitFor(() => detectPostNextState(), deadline);
+  if (transition.blocked) {
+    return failure("检测到风险控制或验证码页面，必须人工处理。", "risk_control_detected", {
+      transition: options.nextTransition || null,
+      diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null)
+    });
+  }
+  if (!transition.value) {
+    return failure("下一步后页面没有进入可识别的发布流程，已停止。", "post_next_state_unknown", {
+      transition: options.nextTransition || null,
+      diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null)
+    });
+  }
+  if (transition.value.kind === "validation") {
+    return failure("番茄没有接受“下一步”：页面仍有必填项或内容校验错误。", "post_next_validation_error", {
+      validationMessages: transition.value.messages,
+      transition: options.nextTransition || null,
+      diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null)
+    });
+  }
   if (transition.value.kind === "typo") {
     const submit = findButtonInRoot(transition.value.root, ["提交"]);
     if (!submit.element) return failure("已识别错别字提示，但没有找到同一弹窗内的提交按钮。", "typo_submit_missing");
     clickVisible(submit.element);
     const disappeared = await waitFor(() => !findTypoDialog(), Date.now() + 8_000);
     if (!disappeared.value) return failure("错别字提示提交后没有消失，已停止。", "typo_dialog_not_closed");
+    // The full-check control is mounted asynchronously in some Fanqie releases.
+    // Do not fail in the small gap between the typo dialog disappearing and the next
+    // stage appearing.
+    const nextStage = await waitFor(() => {
+      if (findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu)) return { blocked: true };
+      return findPublicationRoot() || hasPublicationSettings(visiblePageText()) || findActionButton(["全面检测", "全文检测"]).element;
+    }, Date.now() + 10_000);
+    if (nextStage.blocked) return failure("错别字提示后出现风险控制，已停止。", "risk_control_detected");
+    if (!nextStage.value) {
+      return failure("错别字提示已提交，但后续检测页面没有加载出来。", "post_typo_state_unknown", {
+        diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null)
+      });
+    }
   }
 
   const risk = findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu);
   if (risk) return failure("检测到风险控制或验证码页面，必须人工处理。", "risk_control_detected");
 
   const settingsAlreadyVisible = hasPublicationSettings(visiblePageText());
-  const fullCheck = findActionButton(["全面检测"]);
+  const fullCheck = findActionButton(["全面检测", "全文检测"]);
   if (!settingsAlreadyVisible && !fullCheck.element) {
     return failure("没有找到“全面检测”按钮或发布设置，页面状态未知。", "full_check_button_missing");
   } else if (!settingsAlreadyVisible) {
@@ -517,7 +568,7 @@ async function completePublicationFlow(options) {
       if (findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu)) return { blocked: true };
       const text = visiblePageText();
       const settings = hasPublicationSettings(text);
-      const button = findActionButton(["全面检测"]);
+      const button = findActionButton(["全面检测", "全文检测"]);
       const completeText = /检测完成|检测通过|检测结果|发布设置/iu.test(text);
       return settings || (completeText && text !== before && (!button.element || !button.element.disabled));
     }, Date.now() + AUTOMATION_LIMITS.fullCheckMs);
@@ -619,6 +670,122 @@ function verifyPublicationContext(root, options) {
     });
   }
   return { ok: true, chapterNo };
+}
+
+function detectPostNextState() {
+  const riskDialog = findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu);
+  if (riskDialog) return { blocked: true };
+  const typoDialog = findTypoDialog();
+  if (typoDialog) return { value: { kind: "typo", root: typoDialog } };
+  if (findPublicationRoot() || hasPublicationSettings(visiblePageText())) {
+    return { value: { kind: "ready" } };
+  }
+  if (findActionButton(["全面检测", "全文检测"]).element) {
+    return { value: { kind: "ready" } };
+  }
+  const messages = visibleValidationMessages();
+  if (messages.length) return { value: { kind: "validation", messages } };
+  return false;
+}
+
+function visibleValidationMessages() {
+  const pattern = /(?:标题|正文|章节|字数|内容).{0,18}(?:不能为空|未填写|不符合|错误|失败|限制|至少|最多)|请(?:填写|输入|完善).{0,18}(?:标题|正文|章节|内容)/iu;
+  return [...document.querySelectorAll(
+    "[role='alert'], [aria-live='assertive'], .error, [class*='error'], [class*='invalid'], [class*='form-message'], [class*='form-item-message']"
+  )]
+    .filter(isVisible)
+    .map((element) => normalizeBody(readField(element)))
+    .filter((text) => text && text.length <= 500 && pattern.test(text))
+    .filter((text, index, values) => values.indexOf(text) === index)
+    .slice(0, 12);
+}
+
+function captureTransitionDiagnostics(baseline = null) {
+  const fields = locateFields();
+  const text = visiblePageText();
+  const dialogs = [...document.querySelectorAll(
+    "[role='dialog'], [aria-modal='true'], .modal, .dialog, [class*='modal'], [class*='dialog'], [class*='popup'], [class*='confirm'], [class*='message-box']"
+  )]
+    .filter(isVisible)
+    .map((element) => ({
+      element: describeElement(element),
+      text: normalizeBody(readField(element)).slice(0, 800)
+    }))
+    .filter((item) => item.text)
+    .slice(0, 12);
+  const visibleButtons = [...document.querySelectorAll(
+    "button, [role='button'], a[href], input[type='button'], input[type='submit']"
+  )]
+    .filter(isVisible)
+    .filter(isActionEnabled)
+    .map(describeActionElement)
+    .filter((item) => item.text || item.ariaLabel)
+    .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left)
+    .slice(0, 40);
+  let state = "unknown";
+  if (isLoginPage(text)) state = "login_required";
+  else if (findPublicationRoot() || hasPublicationSettings(text)) state = "publish_settings";
+  else if (fields.titleField && fields.editor) state = "editor";
+  else if (isWriterPage(text)) state = "writer";
+  const url = location.href;
+  return {
+    capturedAt: new Date().toISOString(),
+    url,
+    urlChanged: Boolean(baseline?.url && baseline.url !== url),
+    title: document.title,
+    readyState: document.readyState,
+    state,
+    workId: extractPlatformWorkId(url),
+    editor: {
+      present: Boolean(fields.titleField && fields.editor),
+      titlePresent: Boolean(fields.titleField),
+      chapterNumberPresent: Boolean(fields.chapterNumberField),
+      observedTitle: fields.titleField ? readField(fields.titleField).trim().slice(0, 240) : "",
+      observedChapterNo: fields.chapterNumberField ? readField(fields.chapterNumberField).trim().slice(0, 80) : "",
+      observedCharCount: fields.editor ? countVisibleCharacters(normalizeBody(readField(fields.editor))) : 0,
+      diagnostics: fields.diagnostics
+    },
+    visibleButtons,
+    dialogs,
+    validationMessages: visibleValidationMessages(),
+    pageTextStart: text.slice(0, 1200),
+    pageTextEnd: text.slice(-1200)
+  };
+}
+
+function inspectWorks(expectedBookName = null) {
+  const text = visiblePageText();
+  if (isLoginPage(text)) return failure("番茄登录状态已失效，请先登录。", "login_required");
+  const expected = normalizeCompact(expectedBookName || "");
+  const byWorkId = new Map();
+  for (const anchor of document.querySelectorAll("a[href]")) {
+    if (!isVisible(anchor)) continue;
+    const href = anchor.href || anchor.getAttribute("href") || "";
+    const workId = extractPlatformWorkId(href);
+    if (!workId) continue;
+    const root = anchor.closest("article, li, tr, [class*='book'], [class*='card'], [class*='work'], [class*='item']") || anchor;
+    const rootText = normalizeBody(readField(root)).slice(0, 1000);
+    const anchorText = normalizeBody(readField(anchor)).slice(0, 300);
+    const name = rootText || anchorText;
+    const candidate = {
+      workId,
+      name,
+      href,
+      matchesBookName: Boolean(expected && normalizeCompact(name).includes(expected))
+    };
+    const previous = byWorkId.get(workId);
+    if (!previous || candidate.matchesBookName || (!previous.matchesBookName && candidate.name.length < previous.name.length)) {
+      byWorkId.set(workId, candidate);
+    }
+  }
+  const works = [...byWorkId.values()];
+  return {
+    ok: true,
+    state: "book_manage",
+    url: location.href,
+    works,
+    matchedWorkId: works.find((item) => item.matchesBookName)?.workId || (works.length === 1 ? works[0].workId : null)
+  };
 }
 
 function inspectPublicationList(chapterNos) {
@@ -821,29 +988,91 @@ function findButtonInRoot(root, texts) {
   return findActionButton(texts, root);
 }
 
+function isActionEnabled(element) {
+  if (!element) return false;
+  if ("disabled" in element && element.disabled) return false;
+  if (element.getAttribute("aria-disabled") === "true") return false;
+  const className = typeof element.className === "string" ? element.className : "";
+  return !/(?:^|[\s_-])disabled(?:$|[\s_-])/iu.test(className);
+}
+
+function actionText(element) {
+  return normalizeCompact(element?.innerText || element?.textContent || element?.value || element?.getAttribute?.("aria-label") || "");
+}
+
+function describeActionElement(element) {
+  const rect = element.getBoundingClientRect();
+  const className = typeof element.className === "string" ? element.className : "";
+  return {
+    tag: element.tagName,
+    id: element.id || "",
+    className: className.slice(0, 220),
+    role: element.getAttribute("role") || "",
+    ariaLabel: element.getAttribute("aria-label") || "",
+    text: actionText(element).slice(0, 240),
+    rect: {
+      top: Math.round(rect.top),
+      left: Math.round(rect.left),
+      right: Math.round(rect.right),
+      bottom: Math.round(rect.bottom),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    }
+  };
+}
+
+function findStrictNextButton(root = document) {
+  const candidates = [...root.querySelectorAll("button, [role='button']")]
+    .filter(isVisible)
+    .filter(isActionEnabled)
+    .filter((element) => actionText(element) === normalizeCompact("下一步"))
+    .filter((element) => !element.closest(
+      "[role='dialog'], [aria-modal='true'], [class*='guide'], [class*='tutorial'], [class*='tour'], [class*='popover']"
+    ))
+    .map((element) => {
+      const descriptor = describeActionElement(element);
+      const actionArea = Boolean(element.closest(
+        "footer, [class*='footer'], [class*='bottom'], [class*='action'], [class*='operation'], [class*='operate'], [class*='submit']"
+      ));
+      return { element, descriptor, actionArea };
+    });
+  const scoped = candidates.some((item) => item.actionArea)
+    ? candidates.filter((item) => item.actionArea)
+    : candidates;
+  scoped.sort((a, b) => (
+    b.descriptor.rect.bottom - a.descriptor.rect.bottom ||
+    b.descriptor.rect.right - a.descriptor.rect.right
+  ));
+  return {
+    element: scoped[0]?.element || null,
+    candidates: candidates
+      .map((item) => ({ ...item.descriptor, actionArea: item.actionArea }))
+      .sort((a, b) => b.rect.bottom - a.rect.bottom)
+      .slice(0, 12)
+  };
+}
+
 function findActionButton(texts, root = document) {
   const wanted = texts.map((text) => normalizeCompact(text));
-  const candidates = [...root.querySelectorAll("button, [role='button'], a, input[type='button'], input[type='submit'], div")]
+  const candidates = [...root.querySelectorAll("button, [role='button'], a, input[type='button'], input[type='submit']")]
     .filter(isVisible)
-    .filter((element) => !("disabled" in element && element.disabled))
+    .filter(isActionEnabled)
     .map((element) => {
-      const text = normalizeCompact(element.innerText || element.textContent || element.value || "");
+      const text = actionText(element);
       const exactIndex = wanted.findIndex((item) => text === item);
       const containsIndex = wanted.findIndex((item) => text.includes(item));
-      const rect = element.getBoundingClientRect();
-      const descriptor = `${element.id} ${element.className || ""} ${element.getAttribute("aria-label") || ""}`;
+      const descriptor = describeActionElement(element);
       let score = exactIndex >= 0 ? 1000 - exactIndex * 20 : containsIndex >= 0 ? 500 - containsIndex * 20 : -1;
       if (score < 0) return null;
-      if (/guide|tutorial|新手|tour|popover/iu.test(descriptor)) score -= 500;
-      if (/next|submit|publish|发布|下一步/iu.test(descriptor)) score += 50;
-      score += Math.max(0, 100 - Math.round(rect.top));
+      if (/guide|tutorial|新手|tour|popover/iu.test(`${descriptor.id} ${descriptor.className} ${descriptor.ariaLabel}`)) score -= 500;
+      if (/next|submit|publish|发布|下一步/iu.test(`${descriptor.id} ${descriptor.className} ${descriptor.ariaLabel}`)) score += 50;
       return { element, score, text, descriptor };
     })
     .filter(Boolean)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.score - a.score || b.descriptor.rect.bottom - a.descriptor.rect.bottom);
   return {
     element: candidates[0]?.element || null,
-    candidates: candidates.slice(0, 8).map((item) => ({ text: item.text, score: item.score, descriptor: item.descriptor.slice(0, 180) }))
+    candidates: candidates.slice(0, 8).map((item) => ({ text: item.text, score: item.score, ...item.descriptor }))
   };
 }
 
@@ -918,7 +1147,7 @@ function hasPublicationSettings(text) {
 function extractPlatformWorkId(url) {
   try {
     const pathname = new URL(url).pathname;
-    const managed = pathname.match(/\/main\/writer\/chapter-manage\/(\d{10,})/u);
+    const managed = pathname.match(/\/main\/writer\/(?:chapter-manage|book-info)\/(\d{10,})/u);
     if (managed) return managed[1];
     const workRoot = pathname.match(/\/main\/writer\/(\d{10,})(?:\/|$)/u);
     return workRoot ? workRoot[1] : null;

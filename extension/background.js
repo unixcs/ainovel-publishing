@@ -7,12 +7,15 @@ const DEFAULT_SETTINGS = {
   selectedSlot: "20:00",
   aiPolicy: "remember",
   aiChoiceByBook: {},
-  platformWorkIdByBook: {}
+  platformWorkIdByBook: {},
+  platformPreflightByBook: {}
 };
 const TARGET_ROOT_HOST = "fanqienovel.com";
-const WRITER_URL = "https://fanqienovel.com/main/writer/";
+const BOOK_MANAGE_URL = "https://fanqienovel.com/main/writer/book-manage";
 const AUTOMATION_ALARM = "ainovel-publication-runner";
-const AUTOMATION_SAFETY_EPOCH = "0.3.1-recoverable-pre-submit-flow";
+const AUTOMATION_SAFETY_EPOCH = "0.3.2-canonical-preflight-strict-next";
+const PLATFORM_PREFLIGHT_TTL_MS = 10 * 60 * 1000;
+const PAGE_ADAPTER_VERSION = "0.3.2";
 let automationLock = false;
 const safetyReady = enforceAutomationSafetyEpoch();
 
@@ -226,7 +229,8 @@ async function automateChapter(bookId, chapterNo, planId) {
     const bookCatalog = await apiRequest("/api/v1/books");
     const expectedBook = (bookCatalog.books || []).find((entry) => entry.book_id === bookId);
     if (!expectedBook) throw new Error("本地账本中没有找到目标作品。");
-    const expectedWorkId = await platformWorkIdForBook(bookId);
+    let expectedWorkId = await platformWorkIdForBook(bookId);
+    if (!expectedWorkId) expectedWorkId = await resolvePlatformWorkId(bookId, expectedBook);
     if (plan.status !== "approved") throw new Error(`发布计划状态 ${plan.status} 不允许执行。`);
     const item = (plan.items || []).find((entry) => Number(entry.chapter_no) === chapterNo);
     if (!item) throw new Error("发布计划中没有目标章节。");
@@ -258,7 +262,7 @@ async function automateChapter(bookId, chapterNo, planId) {
 
     const tab = resumeCurrentEditor
       ? await findMatchingEditorTab(chapter, expectedWorkId)
-      : await ensureWriterTab(expectedWorkId);
+      : (await recentPlatformPreflightTab(bookId, expectedWorkId)) || await ensureChapterManagementTab(expectedWorkId);
     const identity = { bookName: expectedWorkId ? null : expectedBook.name, workId: expectedWorkId };
     const page = await sendPageAction(tab.id, { type: "inspectPage", ...identity });
     if (!page?.ok || page.state === "login_required") {
@@ -293,6 +297,7 @@ async function automateChapter(bookId, chapterNo, planId) {
       // Clicking “new chapter” may create a draft even if the following response is lost.
       pageMutationStarted = true;
       const opened = await sendPageAction(tab.id, { type: "openNewChapter", ...identity });
+      await clearPlatformPreflight(bookId);
       if (!opened?.ok) {
         throw automationFailure(opened?.error || "打开新建章节失败。", opened?.code || "new_chapter_failed", opened);
       }
@@ -313,7 +318,13 @@ async function automateChapter(bookId, chapterNo, planId) {
 
     const next = await sendPageAction(editorTab.id, { type: "clickNext", chapter: chapterPayload(chapter) });
     if (!next?.ok) throw automationFailure(next?.error || "点击下一步前校验失败。", next?.code || "next_failed", next);
-    await safePostEvent(bookId, chapterNo, "next_clicked", chapter.text_sha256, { plan_id: planId });
+    await safePostEvent(bookId, chapterNo, "next_clicked", chapter.text_sha256, {
+      plan_id: planId,
+      selected_button: next.selected || null,
+      page_url_before: next.transition?.before?.url || editorTab.url,
+      page_url_after: next.transition?.after?.url || null,
+      editor_present_after: next.transition?.after?.editor?.present ?? null
+    });
 
     // Fanqie reveals the typo prompt/full-check flow in the same editor tab. Let the
     // page adapter observe that transition directly; waiting for a separately classified
@@ -328,7 +339,8 @@ async function automateChapter(bookId, chapterNo, planId) {
         aiPolicy: resolvedAiPolicy,
         chapterNo,
         title: chapter.title,
-        deferFinalSubmit: true
+        deferFinalSubmit: true,
+        nextTransition: next.transition || null
       }
     });
     if (publication?.paused && publication?.code === "ai_choice_required") {
@@ -546,18 +558,170 @@ async function runApprovedPlanItems() {
   return { skipped: true, reason: "no_approved_items" };
 }
 
-async function ensureWriterTab(expectedWorkId = null) {
+function canonicalChapterManagementUrl(workId) {
+  return `https://fanqienovel.com/main/writer/chapter-manage/${encodeURIComponent(String(workId))}?type=1`;
+}
+
+function isChapterManagementUrl(url, expectedWorkId = null) {
+  try {
+    const parsed = new URL(url);
+    const match = parsed.pathname.match(/^\/main\/writer\/chapter-manage\/(\d{10,})(?:&.*)?$/u);
+    return Boolean(match && (!expectedWorkId || match[1] === String(expectedWorkId)));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function isCanonicalChapterManagementUrl(url, workId) {
+  try {
+    const current = new URL(url);
+    const expected = new URL(canonicalChapterManagementUrl(workId));
+    return current.origin === expected.origin && current.pathname === expected.pathname && current.searchParams.get("type") === "1";
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function ensureChapterManagementTab(expectedWorkId) {
+  if (!expectedWorkId) throw automationFailure("还没有绑定番茄作品，无法打开章节管理页。", "platform_work_not_bound");
   const tabs = await chrome.tabs.query({ currentWindow: true });
-  const matching = (tab) => tab.id && isFanqieUrl(tab.url) && (!expectedWorkId || extractPlatformWorkId(tab.url) === expectedWorkId);
-  const active = tabs.find((tab) => tab.active && matching(tab));
-  const existing = active || tabs.find(matching);
-  if (existing) return existing;
-  const url = expectedWorkId
-    ? `https://fanqienovel.com/main/writer/chapter-manage/${expectedWorkId}?type=1`
-    : WRITER_URL;
-  const created = await chrome.tabs.create({ url, active: true });
-  await waitForTabComplete(created.id, 30_000);
-  return chrome.tabs.get(created.id);
+  const matching = tabs.filter((tab) => tab.id && isChapterManagementUrl(tab.url, expectedWorkId));
+  let tab = matching.find((entry) => entry.active) || matching[0] || null;
+  const url = canonicalChapterManagementUrl(expectedWorkId);
+  if (!tab) {
+    tab = await chrome.tabs.create({ url, active: true });
+  } else if (!isCanonicalChapterManagementUrl(tab.url, expectedWorkId)) {
+    tab = await chrome.tabs.update(tab.id, { url, active: true });
+  } else if (!tab.active) {
+    tab = await chrome.tabs.update(tab.id, { active: true });
+  }
+  await waitForTabComplete(tab.id, 30_000);
+  await waitForPageScript(tab.id, 15_000);
+  return chrome.tabs.get(tab.id);
+}
+
+async function ensureBookManagementTab() {
+  const tabs = await chrome.tabs.query({ currentWindow: true });
+  const isBookManagement = (tab) => {
+    try { return tab.id && new URL(tab.url).pathname === "/main/writer/book-manage"; } catch (_error) { return false; }
+  };
+  let tab = tabs.find((entry) => entry.active && isBookManagement(entry)) || tabs.find(isBookManagement);
+  if (!tab) tab = await chrome.tabs.create({ url: BOOK_MANAGE_URL, active: true });
+  else if (!tab.active) tab = await chrome.tabs.update(tab.id, { active: true });
+  await waitForTabComplete(tab.id, 30_000);
+  await waitForPageScript(tab.id, 15_000);
+  return chrome.tabs.get(tab.id);
+}
+
+async function resolvePlatformWorkId(bookId, expectedBook) {
+  const stored = await platformWorkIdForBook(bookId);
+  if (stored) return stored;
+
+  // If the user already opened exactly one chapter-management page, that URL is the
+  // strongest identity evidence and avoids guessing from a possibly different title.
+  const tabs = await chrome.tabs.query({ currentWindow: true });
+  const visibleWorkIds = [...new Set(tabs
+    .filter((tab) => tab.id && isChapterManagementUrl(tab.url))
+    .map((tab) => extractPlatformWorkId(tab.url))
+    .filter(Boolean))];
+  if (visibleWorkIds.length === 1) {
+    await rememberPlatformWorkIdValue(bookId, visibleWorkIds[0]);
+    return visibleWorkIds[0];
+  }
+
+  // First-time binding: open “我的小说”, read its real links, and bind only an exact
+  // local-name match or the sole work. We never invent a numeric work ID.
+  const tab = await ensureBookManagementTab();
+  const page = await sendPageAction(tab.id, { type: "inspectPage" });
+  if (!page?.ok || page.state === "login_required") {
+    throw automationFailure("番茄登录状态无效，请先在 Edge 中登录。", "login_required", page);
+  }
+  let discovery = null;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    discovery = await sendPageAction(tab.id, { type: "inspectWorks", bookName: expectedBook?.name || null });
+    if (discovery?.matchedWorkId || (discovery?.works || []).length) break;
+    await sleep(400);
+  }
+  if (!discovery?.ok) {
+    throw automationFailure(discovery?.error || "无法读取“我的小说”作品列表。", discovery?.code || "book_list_unrecognized", discovery);
+  }
+  if (!discovery.matchedWorkId) {
+    throw automationFailure(
+      "“我的小说”里有多个作品，无法安全判断本地小说对应哪一本。请打开目标作品的章节管理页后再刷新一次。",
+      "platform_work_binding_required",
+      { works: discovery.works || [] }
+    );
+  }
+  await rememberPlatformWorkIdValue(bookId, discovery.matchedWorkId);
+  return discovery.matchedWorkId;
+}
+
+async function waitForPageScript(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let reloadedForUpgrade = false;
+  while (Date.now() < deadline) {
+    try {
+      const page = await sendPageAction(tabId, { type: "inspectPage" });
+      if (page?.adapterVersion === PAGE_ADAPTER_VERSION) return page;
+      // Reload exactly once when an already-open Fanqie tab still has the previous
+      // extension's content script. This removes the old manual “refresh the tab” step.
+      if (page && !reloadedForUpgrade) {
+        reloadedForUpgrade = true;
+        await chrome.tabs.reload(tabId);
+        await waitForTabComplete(tabId, Math.min(15_000, Math.max(1_000, deadline - Date.now())));
+        continue;
+      }
+    } catch (error) {
+      if (error.code !== "content_script_unavailable") throw error;
+      // Reload once as well when the previous extension context was invalidated and no
+      // listener answers at all after the user reloaded the unpacked extension.
+      if (!reloadedForUpgrade) {
+        reloadedForUpgrade = true;
+        await chrome.tabs.reload(tabId);
+        await waitForTabComplete(tabId, Math.min(15_000, Math.max(1_000, deadline - Date.now())));
+        continue;
+      }
+    }
+    await sleep(300);
+  }
+  throw automationFailure("番茄页面已打开，但 0.3.2 页面适配器没有加载完成。请在扩展管理页重新加载插件。", "content_script_unavailable");
+}
+
+async function recentPlatformPreflightTab(bookId, expectedWorkId) {
+  const stored = await chrome.storage.local.get({ platformPreflightByBook: {} });
+  const preflight = stored.platformPreflightByBook?.[bookId];
+  if (!preflight || preflight.workId !== String(expectedWorkId)) return null;
+  if (Date.now() - Number(preflight.checkedAt || 0) > PLATFORM_PREFLIGHT_TTL_MS) return null;
+  try {
+    const tab = await chrome.tabs.get(Number(preflight.tabId));
+    if (!tab?.id || !isCanonicalChapterManagementUrl(tab.url, expectedWorkId)) return null;
+    return tab;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function rememberPlatformPreflight(bookId, workId, tab, snapshot) {
+  const stored = await chrome.storage.local.get({ platformPreflightByBook: {} });
+  await chrome.storage.local.set({
+    platformPreflightByBook: {
+      ...(stored.platformPreflightByBook || {}),
+      [bookId]: {
+        workId: String(workId),
+        tabId: tab.id,
+        checkedAt: Date.now(),
+        url: snapshot?.url || tab.url
+      }
+    }
+  });
+}
+
+async function clearPlatformPreflight(bookId) {
+  const stored = await chrome.storage.local.get({ platformPreflightByBook: {} });
+  const next = { ...(stored.platformPreflightByBook || {}) };
+  delete next[bookId];
+  await chrome.storage.local.set({ platformPreflightByBook: next });
 }
 
 async function currentFanqieTab() {
@@ -645,11 +809,18 @@ async function sendPageAction(tabId, message) {
 
 async function inspectPlatform(bookId, chapterNos) {
   if (!bookId) throw new Error("缺少作品标识。");
-  const expectedWorkId = await platformWorkIdForBook(bookId);
-  const tab = await ensureWriterTab(expectedWorkId);
+  const bookCatalog = await apiRequest("/api/v1/books");
+  const expectedBook = (bookCatalog.books || []).find((entry) => entry.book_id === bookId);
+  if (!expectedBook) throw new Error("本地账本中没有找到目标作品。");
+  const expectedWorkId = await resolvePlatformWorkId(bookId, expectedBook);
+  const tab = await ensureChapterManagementTab(expectedWorkId);
   const snapshot = await sendPageAction(tab.id, { type: "inspectPublicationList", chapterNos });
-  if (!snapshot?.ok) throw new Error(snapshot?.error || "读取平台章节列表失败。");
-  await rememberPlatformWorkId(bookId, snapshot.url || tab.url);
+  if (!snapshot?.ok) throw automationFailure(snapshot?.error || "读取平台章节列表失败。", snapshot?.code || "publication_list_unrecognized", snapshot);
+  if (snapshot.workId !== String(expectedWorkId)) {
+    throw automationFailure("章节管理页不是已绑定的目标作品，已停止。", "work_identity_mismatch", { expectedWorkId, snapshot });
+  }
+  await rememberPlatformWorkIdValue(bookId, expectedWorkId);
+  await rememberPlatformPreflight(bookId, expectedWorkId, tab, snapshot);
   const publicationSettings = await apiRequest("/api/v1/settings/publication");
   const observations = [];
   const recordObservations = [];
@@ -818,7 +989,7 @@ async function postEvent(bookId, chapterNo, event, textSha256, payload) {
 function extractPlatformWorkId(url) {
   try {
     const pathname = new URL(url).pathname;
-    const managed = pathname.match(/\/main\/writer\/chapter-manage\/(\d{10,})/u);
+    const managed = pathname.match(/\/main\/writer\/(?:chapter-manage|book-info)\/(\d{10,})/u);
     if (managed) return managed[1];
     const workRoot = pathname.match(/\/main\/writer\/(\d{10,})(?:\/|$)/u);
     return workRoot ? workRoot[1] : null;
@@ -830,11 +1001,16 @@ function extractPlatformWorkId(url) {
 async function rememberPlatformWorkId(bookId, url) {
   const workId = extractPlatformWorkId(url);
   if (!bookId || !workId) return null;
+  return rememberPlatformWorkIdValue(bookId, workId);
+}
+
+async function rememberPlatformWorkIdValue(bookId, workId) {
+  if (!bookId || !workId) return null;
   const stored = await chrome.storage.local.get({ platformWorkIdByBook: {} });
   await chrome.storage.local.set({
-    platformWorkIdByBook: { ...(stored.platformWorkIdByBook || {}), [bookId]: workId }
+    platformWorkIdByBook: { ...(stored.platformWorkIdByBook || {}), [bookId]: String(workId) }
   });
-  return workId;
+  return String(workId);
 }
 
 async function platformWorkIdForBook(bookId) {

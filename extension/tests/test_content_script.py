@@ -455,3 +455,122 @@ def test_failure_after_final_submit_is_marked_ambiguous_not_recoverable():
         assert result["ok"] is False
         assert result["finalSubmitAttempted"] is True
         browser.close()
+
+
+def editor_action_html(actions: str, handler: str = "") -> str:
+    return f"""
+    <!doctype html><html><body>
+      <input class="serial-input" value="8">
+      <input class="serial-editor-input-hint-area" value="兽潮前夜">
+      <div class="ProseMirror" contenteditable="true" style="width:800px;height:500px">正文内容</div>
+      {actions}
+      <script>
+        window.chrome = {{runtime: {{onMessage: {{addListener(fn) {{ window.__ainovelListener = fn; }}}}}}}};
+        window.__clicked = [];
+        {handler}
+      </script>
+    </body></html>
+    """
+
+
+def chapter_eight() -> dict:
+    return {"chapter_no": 8, "title": "第八章 兽潮前夜", "body": "正文内容", "text_sha256": "8" * 64, "char_count": 4}
+
+
+def test_next_never_clicks_plain_div_container():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content(editor_action_html(
+            '<div id="fake-next" style="width:120px;height:40px">下一步</div>',
+            "document.getElementById('fake-next').onclick = () => window.__clicked.push('fake');",
+        ))
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "clickNext", "chapter": chapter_eight()})
+        assert result["ok"] is False
+        assert result["code"] == "next_button_missing"
+        assert page.evaluate("window.__clicked") == []
+        browser.close()
+
+
+def test_next_clicks_bottommost_exact_real_button_in_action_area():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width": 1200, "height": 900})
+        page.set_content(editor_action_html(
+            """
+            <button id="top-next" style="position:absolute;top:20px;left:20px">下一步</button>
+            <div id="plain-container">下一步</div>
+            <footer class="editor-action-footer" style="position:absolute;top:780px;left:20px">
+              <button id="bottom-next">下一步</button>
+            </footer>
+            """,
+            """
+            document.getElementById('top-next').onclick = () => window.__clicked.push('top');
+            document.getElementById('bottom-next').onclick = () => window.__clicked.push('bottom');
+            document.getElementById('plain-container').onclick = () => window.__clicked.push('div');
+            """,
+        ))
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "clickNext", "chapter": chapter_eight()})
+        assert result["ok"] is True
+        assert result["selected"]["id"] == "bottom-next"
+        assert page.evaluate("window.__clicked") == ["bottom"]
+        browser.close()
+
+
+def test_next_records_url_change_and_editor_remount():
+    html = editor_action_html(
+        '<footer class="action-footer"><button id="next">下一步</button></footer>',
+        """
+        document.getElementById('next').onclick = () => {
+          history.pushState({}, '', '/main/writer/7664986207666850841/publish/review');
+          document.querySelector('.serial-input').remove();
+          document.querySelector('.serial-editor-input-hint-area').remove();
+          document.querySelector('.ProseMirror').remove();
+          const full = document.createElement('button'); full.textContent = '全面检测'; document.body.appendChild(full);
+        };
+        """,
+    )
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.route("https://example.test/**", lambda route: route.fulfill(status=200, content_type="text/html; charset=utf-8", body=html))
+        page.goto("https://example.test/main/writer/7664986207666850841/publish/")
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "clickNext", "chapter": chapter_eight()})
+        assert result["ok"] is True
+        assert result["transition"]["after"]["urlChanged"] is True
+        assert result["transition"]["after"]["editor"]["present"] is False
+        assert result["transition"]["after"]["state"] != "editor"
+        browser.close()
+
+
+def test_unknown_post_next_state_returns_actionable_diagnostics():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content(editor_action_html(
+            '<footer class="action-footer"><button id="next">下一步</button></footer>',
+            """
+            document.getElementById('next').onclick = () => {
+              document.querySelector('.serial-input').remove();
+              document.querySelector('.serial-editor-input-hint-area').remove();
+              document.querySelector('.ProseMirror').remove();
+              document.body.insertAdjacentHTML('beforeend', '<p>未知的中间页面</p><button id="draft">保存草稿</button>');
+            };
+            """,
+        ))
+        page.add_script_tag(path=str(SCRIPT))
+        next_result = invoke_action(page, {"type": "clickNext", "chapter": chapter_eight()})
+        result = invoke_action(page, {
+            "type": "completePublicationFlow",
+            "options": {"transitionTimeoutMs": 300, "nextTransition": next_result["transition"]},
+        })
+        assert result["ok"] is False
+        assert result["code"] == "post_next_state_unknown"
+        assert result["diagnostics"]["editor"]["present"] is False
+        assert any(button["text"] == "保存草稿" for button in result["diagnostics"]["visibleButtons"])
+        assert "未知的中间页面" in result["diagnostics"]["pageTextStart"]
+        assert result["transition"]["before"]["editor"]["present"] is True
+        browser.close()

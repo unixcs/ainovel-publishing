@@ -112,7 +112,7 @@ Every state has a timeout, evidence snapshot, and terminal `blocked` outcome. A 
 - End-to-end test that kills/restarts the browser after each state and proves reconciliation prevents duplicate submission.
 - A real run is successful only when Fanqie read-back confirms the intended chapter version and future slot.
 
-Current automated suite: 56 unit/browser tests. The restart fault-injection test and real Fanqie acceptance run remain rollout gates, not assumed successes.
+Current automated suite: 62 unit/browser tests. The restart fault-injection test and real Fanqie acceptance run remain rollout gates, not assumed successes.
 
 
 ## 2026-07-22 live-trial simplification
@@ -122,3 +122,7 @@ Version 0.3.0 implements ADR 0011. The default UI now exposes only refresh and p
 ## 2026-07-22 chapter-8 recovery correction
 
 Version 0.3.1 implements ADR 0012. “Next” is now an explicitly recoverable pre-submit checkpoint rather than an assumed external submission. A live chapter-list absence check plus user acknowledgement can reset such a stopped attempt, while `final_submit_armed` and later checkpoints remain reconciliation-only. Publication preparation and final submission are separate page actions, the typo/full-check transition is recognized directly, and only one draft/approved plan remains active per work.
+
+## 2026-07-22 canonical preflight and strict-Next correction
+
+Version 0.3.2 removes the remaining page ambiguity. First-time work binding reads real IDs from `book-manage`; known work IDs navigate to one canonical chapter-management URL. A successful list read stores a short-lived per-work preflight that the immediately following chapter action reuses. The Next adapter accepts only an exact, visible, enabled `button`/`role=button`, excludes dialogs/guides/popovers, and chooses the bottom-most editor action. Unknown post-Next states persist structured before/after diagnostics. An adapter-version handshake reloads an already-open tab once after extension upgrade. The primary button may recover a pre-final-submit block without a second prompt only when that same user action has just produced a fresh platform-absence snapshot; final-submit ambiguity remains reconciliation-only.

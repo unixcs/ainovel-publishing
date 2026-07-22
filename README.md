@@ -26,7 +26,7 @@ Ainovel source chapters
 
 ## Current status
 
-Version `0.3.1` fixes the live chapter-8 deadlock by separating “Next” from Fanqie's final scheduled-publish boundary. A stopped pre-submit run can be recovered after a fresh platform absence check, while an armed final submission remains fail-closed. The release also keeps exactly one active plan per work and lets the known typo/full-check transition continue without the redundant timeout that caused the false stop. Automatic execution defaults to **off** until a live run completes platform read-back. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for rollout and [`docs/plan-boundaries.md`](docs/plan-boundaries.md) for the confirmed boundaries.
+Version `0.3.2` makes the live path deterministic: refresh opens the bound work's canonical chapter-management URL and records a short-lived preflight; the next action reuses that context instead of bouncing through Fanqie pages. The editor adapter clicks only the bottom-most exact, enabled `button`/`role=button` labelled “下一步”, never a containing `div`, and persists URL/editor/dialog/button diagnostics for any unknown transition. The final-submit checkpoint remains fail-closed, and background automatic execution stays **off** until a live platform read-back succeeds. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for rollout and [`docs/plan-boundaries.md`](docs/plan-boundaries.md) for the confirmed boundaries.
 
 ## Repository layout
 
