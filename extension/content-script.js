@@ -64,15 +64,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 async function dispatchPageAction(message) {
   switch (message.type) {
     case "fillChapter":
-      return fillChapter(message.chapter);
+      return await fillChapter(message.chapter);
     case "inspectChapter":
-      return inspectChapter(message.chapter);
+      return await inspectChapter(message.chapter);
     case "inspectPage":
-      return inspectPage(message.bookName || null);
+      return inspectPage(message.bookName || null, message.workId || null);
     case "openNewChapter":
-      return openNewChapter(message.bookName || null);
+      return openNewChapter(message.bookName || null, message.workId || null);
     case "clickNext":
-      return clickNext(message.chapter);
+      return await clickNext(message.chapter);
     case "completePublicationFlow":
       return completePublicationFlow(message.options || {});
     case "inspectPublicationList":
@@ -82,37 +82,32 @@ async function dispatchPageAction(message) {
   }
 }
 
-function inspectChapter(chapter) {
-  const fields = locateFields();
-  if (!fields.titleField) return failure("没有找到标题输入框，无法对账。", "title_missing", fields.diagnostics);
-  if (!fields.editor) return failure("没有找到正文编辑器，无法对账。", "editor_missing", fields.diagnostics);
-
-  const observedTitle = readField(fields.titleField).trim();
-  const observedBody = normalizeBody(readField(fields.editor));
-  const observedChapterNo = fields.chapterNumberField
-    ? readField(fields.chapterNumberField).trim()
-    : String(chapter.chapter_no);
-  const expectedTitle = pureTitle(chapter.title);
-  const expectedBody = normalizeBody(chapter.body);
-  const expectedChapterNo = String(chapter.chapter_no);
-  return {
-    ok: true,
-    titleMatches: normalizeCompact(observedTitle) === normalizeCompact(expectedTitle),
-    bodyMatches: observedBody === expectedBody,
-    chapterMatches: normalizeChapterNumber(observedChapterNo) === expectedChapterNo,
-    observedTitle,
-    observedBody,
-    observedChapterNo,
-    observedCharCount: countVisibleCharacters(observedBody),
-    diagnostics: fields.diagnostics
-  };
+async function inspectChapter(chapter) {
+  const ready = await waitForEditorFields();
+  if (!ready.value) {
+    const fields = locateFields();
+    if (!fields.titleField) return failure("当前页面不是章节编辑页，或编辑器仍未加载完成。", "title_missing", { diagnostics: fields.diagnostics });
+    return failure("当前页面没有找到正文编辑器。", "editor_missing", { diagnostics: fields.diagnostics });
+  }
+  const fields = ready.value;
+  return compareChapterFields(fields, chapter);
 }
 
-function fillChapter(chapter) {
-  const fields = locateFields();
-  if (!fields.titleField) return failure("没有找到标题输入框，已停止且未操作页面。", "title_missing", fields.diagnostics);
-  if (!fields.editor) return failure("没有找到正文编辑器，已停止且未操作页面。", "editor_missing", fields.diagnostics);
+async function fillChapter(chapter) {
+  // Fanqie's editor is rendered asynchronously. A single immediate query caused the
+  // old UI to fail once and succeed on the second click. Wait here so one click has
+  // one deterministic outcome.
+  const ready = await waitForEditorFields();
+  if (!ready.value) {
+    const fields = locateFields();
+    return failure(
+      "当前页面不是章节编辑页，或编辑器在 10 秒内没有加载完成。请停留在编辑页后重试。",
+      fields.titleField ? "editor_missing" : "title_missing",
+      { diagnostics: fields.diagnostics }
+    );
+  }
 
+  let fields = ready.value;
   const expectedTitle = pureTitle(chapter.title);
   const expectedBody = normalizeBody(chapter.body);
   const expectedChapterNo = String(chapter.chapter_no);
@@ -147,34 +142,71 @@ function fillChapter(chapter) {
   if (!beforeTitle) fillField(fields.titleField, expectedTitle, false);
   if (editorIsEmpty) fillField(fields.editor, expectedBody, true);
 
-  const observedTitle = readField(fields.titleField).trim();
-  const observedBody = normalizeBody(readField(fields.editor));
-  const observedChapterNo = fields.chapterNumberField
-    ? readField(fields.chapterNumberField).trim()
-    : expectedChapterNo;
-  const titleMatches = normalizeCompact(observedTitle) === normalizeCompact(expectedTitle);
-  const bodyMatches = observedBody === expectedBody;
-  const chapterMatches = normalizeChapterNumber(observedChapterNo) === expectedChapterNo;
-  if (!titleMatches || !bodyMatches || !chapterMatches) {
-    return failure("填充后校验不一致，已停止。请不要保存当前页面。", "post_fill_mismatch", {
-      observedTitle,
-      observedChapterNo,
-      observedCharCount: countVisibleCharacters(observedBody),
-      titleMatches,
-      bodyMatches,
-      chapterMatches,
+  // React/ProseMirror may replace the edited node after the input event. Re-locate and
+  // wait for the controlled state to settle rather than making the user click twice.
+  const verified = await waitFor(() => {
+    const current = locateFields();
+    if (!current.titleField || !current.editor) return false;
+    const comparison = compareChapterFields(current, chapter);
+    return comparison.ok && comparison.titleMatches && comparison.bodyMatches && comparison.chapterMatches
+      ? { value: { fields: current, comparison } }
+      : false;
+  }, Date.now() + EDITOR_SETTLE_TIMEOUT_MS);
+
+  if (!verified.value) {
+    fields = locateFields();
+    const comparison = fields.titleField && fields.editor
+      ? compareChapterFields(fields, chapter)
+      : null;
+    return failure("填充后页面没有稳定保存完整内容，已停止。请不要点击下一步。", "post_fill_mismatch", {
+      observedTitle: comparison?.observedTitle || "",
+      observedChapterNo: comparison?.observedChapterNo || "",
+      observedCharCount: comparison?.observedCharCount || 0,
+      titleMatches: comparison?.titleMatches || false,
+      bodyMatches: comparison?.bodyMatches || false,
+      chapterMatches: comparison?.chapterMatches || false,
       diagnostics: fields.diagnostics
     });
   }
 
+  const result = verified.value.comparison;
   return {
     ok: true,
+    observedTitle: result.observedTitle,
+    observedChapterNo: result.observedChapterNo,
+    observedCharCount: result.observedCharCount,
+    alreadyPresent: Boolean(beforeTitle && !editorIsEmpty),
+    diagnostics: verified.value.fields.diagnostics
+  };
+}
+
+function compareChapterFields(fields, chapter) {
+  const observedTitle = readField(fields.titleField).trim();
+  const observedBody = normalizeBody(readField(fields.editor));
+  const observedChapterNo = fields.chapterNumberField
+    ? readField(fields.chapterNumberField).trim()
+    : String(chapter.chapter_no);
+  const expectedTitle = pureTitle(chapter.title);
+  const expectedBody = normalizeBody(chapter.body);
+  const expectedChapterNo = String(chapter.chapter_no);
+  return {
+    ok: true,
+    titleMatches: normalizeCompact(observedTitle) === normalizeCompact(expectedTitle),
+    bodyMatches: observedBody === expectedBody,
+    chapterMatches: normalizeChapterNumber(observedChapterNo) === expectedChapterNo,
     observedTitle,
+    observedBody,
     observedChapterNo,
     observedCharCount: countVisibleCharacters(observedBody),
-    alreadyPresent: Boolean(beforeTitle && !editorIsEmpty),
     diagnostics: fields.diagnostics
   };
+}
+
+async function waitForEditorFields(timeoutMs = EDITOR_READY_TIMEOUT_MS) {
+  return waitFor(() => {
+    const fields = locateFields();
+    return fields.titleField && fields.editor ? { value: fields } : false;
+  }, Date.now() + timeoutMs);
 }
 
 function locateFields() {
@@ -367,8 +399,10 @@ const AUTOMATION_LIMITS = {
   successMs: 25_000,
   pollMs: 250
 };
+const EDITOR_READY_TIMEOUT_MS = 10_000;
+const EDITOR_SETTLE_TIMEOUT_MS = 4_000;
 
-function inspectPage(expectedBookName = null) {
+function inspectPage(expectedBookName = null, expectedWorkId = null) {
   const body = visiblePageText();
   const fields = locateFields();
   const loginRequired = isLoginPage(body);
@@ -380,7 +414,10 @@ function inspectPage(expectedBookName = null) {
   else if (publishSettings) state = "publish_settings";
   else if (editor) state = "editor";
   else if (writer) state = "writer";
-  const workMatches = !expectedBookName || normalizeCompact(body).includes(normalizeCompact(expectedBookName));
+  const currentWorkId = extractPlatformWorkId(location.href);
+  const workMatches = expectedWorkId
+    ? currentWorkId === String(expectedWorkId)
+    : (!expectedBookName || normalizeCompact(body).includes(normalizeCompact(expectedBookName)));
   return {
     ok: state !== "unknown",
     state,
@@ -391,39 +428,41 @@ function inspectPage(expectedBookName = null) {
     editor,
     publishSettings,
     expectedBookName,
+    expectedWorkId,
+    currentWorkId,
     workMatches,
     diagnostics: fields.diagnostics,
     bodyPreview: body.slice(0, 500)
   };
 }
 
-function openNewChapter(expectedBookName = null) {
+function openNewChapter(expectedBookName = null, expectedWorkId = null) {
   const pageText = visiblePageText();
   if (isLoginPage(pageText)) return failure("番茄登录状态已失效，请先登录。", "login_required");
-  if (expectedBookName && !normalizeCompact(pageText).includes(normalizeCompact(expectedBookName))) {
+  const currentWorkId = extractPlatformWorkId(location.href);
+  if (expectedWorkId && currentWorkId !== String(expectedWorkId)) {
+    return failure("当前番茄页面不是已绑定的目标作品，拒绝创建章节。", "work_identity_mismatch", { currentWorkId, expectedWorkId });
+  }
+  if (!expectedWorkId && expectedBookName && !normalizeCompact(pageText).includes(normalizeCompact(expectedBookName))) {
     return failure("当前作家后台没有识别到目标作品，拒绝创建章节。", "work_identity_mismatch");
   }
-  const root = expectedBookName ? findWorkRoot(expectedBookName) : document;
+  const root = !expectedWorkId && expectedBookName ? findWorkRoot(expectedBookName) : document;
   const button = findActionButton(["新建章节", "新建章"], root || document).element;
   if (!button) return failure("没有找到可验证的“新建章节”按钮。", "new_chapter_button_missing");
   clickVisible(button);
   return { ok: true, code: "new_chapter_clicked", page: inspectPage() };
 }
 
-function clickNext(chapter) {
-  const fields = locateFields();
-  if (!fields.titleField || !fields.editor) return failure("点击下一步前未识别到编辑器。", "editor_missing");
+async function clickNext(chapter) {
+  const ready = await waitForEditorFields();
+  if (!ready.value) return failure("点击下一步前未识别到已加载完成的编辑器。", "editor_missing");
   if (chapter) {
-    const expectedTitle = pureTitle(chapter.title);
-    const observedTitle = readField(fields.titleField).trim();
-    const observedBody = normalizeBody(readField(fields.editor));
-    const expectedBody = normalizeBody(chapter.body);
-    const observedNo = fields.chapterNumberField ? readField(fields.chapterNumberField).trim() : String(chapter.chapter_no);
-    if (normalizeCompact(observedTitle) !== normalizeCompact(expectedTitle) || observedBody !== expectedBody || normalizeChapterNumber(observedNo) !== String(chapter.chapter_no)) {
+    const comparison = compareChapterFields(ready.value, chapter);
+    if (!comparison.titleMatches || !comparison.bodyMatches || !comparison.chapterMatches) {
       return failure("点击下一步前页面内容校验失败，已停止。", "pre_next_mismatch", {
-        observedTitle,
-        observedChapterNo: observedNo,
-        observedCharCount: countVisibleCharacters(observedBody)
+        observedTitle: comparison.observedTitle,
+        observedChapterNo: comparison.observedChapterNo,
+        observedCharCount: comparison.observedCharCount
       });
     }
   }
@@ -548,8 +587,8 @@ function inspectPublicationList(chapterNos) {
   const rowCandidates = [...document.querySelectorAll("tr, li, article, [role='row'], [class*='chapter'], [class*='row'], div")]
     .filter(isVisible)
     .map((element) => normalizeBody(readField(element)))
-    .filter((value) => value && value.length <= 1200);
-  const textLines = text.split("\n");
+    .filter((value) => value && value.length <= 1600);
+  const textLines = text.split("\n").map((line) => line.trim()).filter(Boolean);
   const rows = [];
   for (const chapterNo of chapterNos.map(Number)) {
     const rowText = findChapterRowText(chapterNo, rowCandidates, textLines);
@@ -558,33 +597,65 @@ function inspectPublicationList(chapterNos) {
     const publicationTime = timeMatch
       ? `${String(timeMatch[1]).padStart(2, "0")}:${timeMatch[2]}`
       : null;
+    const published = Boolean(rowText && /已发布|已上线/iu.test(rowText));
+    const reviewing = Boolean(rowText && /审核中|待审核|审核通过|审核未通过|审核失败|驳回/iu.test(rowText));
+    const scheduled = Boolean(rowText && !published && (/定时|待发布|已安排/iu.test(rowText) || (reviewing && publicationDate)));
+    const draft = Boolean(rowText && /草稿|未提交/iu.test(rowText));
     rows.push({
       chapterNo,
       found: Boolean(rowText),
       text: rowText || null,
-      scheduled: Boolean(rowText && /定时|待发布|已安排/iu.test(rowText)),
-      published: Boolean(rowText && /已发布|已上线/iu.test(rowText)),
+      scheduled,
+      published,
+      reviewing,
+      draft,
+      platformStatus: published ? "published" : reviewing ? "reviewing" : scheduled ? "scheduled" : draft ? "draft" : "unknown",
       publicationDate,
       publicationTime
     });
   }
-  return { ok: true, state: "publication_list", url: location.href, rows };
+  return { ok: true, state: "publication_list", url: location.href, workId: extractPlatformWorkId(location.href), rows };
 }
 
 function findChapterRowText(chapterNo, rowCandidates, textLines) {
   const pattern = new RegExp(`(?:第\\s*${chapterNo}\\s*章|章节号[^\\d]{0,8}${chapterNo}(?:\\D|$))`, "iu");
-  const candidates = rowCandidates.filter((value) => pattern.test(value));
-  const withState = candidates
-    .filter((value) => /定时|待发布|已安排|已发布|已上线|草稿/iu.test(value))
-    .sort((a, b) => a.length - b.length);
-  if (withState.length) return withState[0].slice(0, 500);
-  candidates.sort((a, b) => a.length - b.length);
-  if (candidates.length) return candidates[0].slice(0, 500);
+  const statePattern = /定时|待发布|已安排|已发布|已上线|草稿|未提交|审核中|待审核|审核通过|审核未通过|审核失败|驳回/iu;
 
-  // Text-only fallback stays on one visual line so a neighbouring chapter's date
-  // cannot be mistaken for this chapter's schedule.
-  const line = textLines.find((value) => pattern.test(value));
-  return line ? line.slice(0, 500) : "";
+  // A container that mentions several chapters is a table/list ancestor, not a row.
+  // Reject it so chapter 6 cannot borrow chapter 4's “已发布” state.
+  const candidates = rowCandidates
+    .filter((value) => pattern.test(value))
+    .filter((value) => {
+      const numbers = distinctChapterNumbers(value);
+      return numbers.size === 0 || (numbers.size === 1 && numbers.has(Number(chapterNo)));
+    });
+
+  const lineBlock = chapterTextBlock(chapterNo, textLines);
+  if (lineBlock) candidates.push(lineBlock);
+  const unique = [...new Set(candidates)];
+  const withState = unique.filter((value) => statePattern.test(value)).sort((a, b) => a.length - b.length);
+  if (withState.length) return withState[0].slice(0, 700);
+  unique.sort((a, b) => a.length - b.length);
+  return unique.length ? unique[0].slice(0, 700) : "";
+}
+
+function distinctChapterNumbers(text) {
+  const result = new Set();
+  for (const match of String(text || "").matchAll(/第\s*(\d+)\s*章/gu)) result.add(Number(match[1]));
+  return result;
+}
+
+function chapterTextBlock(chapterNo, textLines) {
+  const startPattern = new RegExp(`^第\\s*${chapterNo}\\s*章(?:\\s|$)`, "iu");
+  const anyChapterPattern = /^第\s*\d+\s*章(?:\s|$)/iu;
+  const start = textLines.findIndex((line) => startPattern.test(line));
+  if (start < 0) return "";
+  const block = [textLines[start]];
+  for (let index = start + 1; index < textLines.length && block.length < 12; index += 1) {
+    if (anyChapterPattern.test(textLines[index])) break;
+    block.push(textLines[index]);
+  }
+  return normalizeBody(block.join("\n"));
 }
 
 function parsePublicationDate(text) {
@@ -781,6 +852,18 @@ function timeMatches(observed, expected) {
 
 function hasPublicationSettings(text) {
   return /发布设置|定时发布|确认发布/iu.test(String(text || ""));
+}
+
+function extractPlatformWorkId(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    const managed = pathname.match(/\/main\/writer\/chapter-manage\/(\d{10,})/u);
+    if (managed) return managed[1];
+    const workRoot = pathname.match(/\/main\/writer\/(\d{10,})(?:\/|$)/u);
+    return workRoot ? workRoot[1] : null;
+  } catch (_error) {
+    return null;
+  }
 }
 
 function isWriterPage(text) {

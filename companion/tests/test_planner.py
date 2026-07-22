@@ -61,7 +61,7 @@ def test_existing_schedule_version_conflict_blocks():
     assert plan[0].reason == "existing_schedule_version_conflict"
 
 
-def test_existing_schedule_without_version_evidence_reserves_quota_but_blocks_adoption():
+def test_existing_schedule_without_version_evidence_is_reserved_without_duplicate_submission():
     plan = build_publication_plan(
         [chapter(4, 6000), chapter(6, 3000)],
         existing_schedules=[{
@@ -75,8 +75,8 @@ def test_existing_schedule_without_version_evidence_reserves_quota_but_blocks_ad
         }],
         start_date=date(2026, 7, 23),
     )
-    assert plan[0].status == "blocked"
-    assert plan[0].reason == "existing_schedule_version_unverified"
+    assert plan[0].status == "reserved"
+    assert plan[0].reason == "existing_platform_record_unverified"
     assert plan[0].publication_date == "2026-07-23"
     assert plan[1].publication_date == "2026-07-24"
 
@@ -105,10 +105,11 @@ def test_over_limit_is_blocked_not_split():
     assert plan[0].reason == "chapter_exceeds_daily_limit"
 
 
-def test_previously_filled_editor_is_blocked_from_new_chapter_creation():
+def test_previously_filled_editor_is_planned_as_safe_resume_not_new_creation():
     plan = build_publication_plan([chapter(6, 100, status="filled")], start_date=date(2026, 7, 23))
-    assert plan[0].status == "blocked"
-    assert plan[0].reason == "chapter_status:filled"
+    assert plan[0].status == "planned"
+    assert plan[0].reason == "resume_current_editor"
+    assert plan[0].publication_date == "2026-07-23"
 
 
 def test_observed_platform_draft_blocks_new_chapter_creation():

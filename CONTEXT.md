@@ -27,7 +27,7 @@ _Avoid_: Latest chapter, file copy
 ## Platform publication language
 
 **Publish Status**:
-The lifecycle state of a chapter in this workflow: `ready`, `synced`, `planned`, `filling`, `awaiting_ai_choice`, `submitted`, `scheduled`, `published`, `version_conflict`, or `blocked`.
+The lifecycle state of a chapter in this workflow: `ready`, `synced`, `planned`, `reserved`, `filling`, `awaiting_ai_choice`, `submitted`, `scheduled`, `published`, `version_conflict`, or `blocked`.
 _Avoid_: Step, progress flag
 
 **Editor Fill**:
@@ -57,6 +57,10 @@ _Avoid_: Verified chapter, matching version
 **Existing Schedule**:
 A scheduled or pending Fanqie chapter found during reconciliation before this workflow creates a new submission.
 _Avoid_: Duplicate task, stale cache
+
+**Reserved Platform Chapter**:
+An existing Fanqie row that has enough chapter/date evidence to reserve quota and prevent duplicate submission, while its body version remains unclaimed until reconciliation.
+_Avoid_: Failed chapter, verified version
 
 ## Quota and policy language
 

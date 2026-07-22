@@ -1,6 +1,6 @@
 "use strict";
 
-const state = { books: [], chapters: [], selected: null, plans: [], currentPlan: null, publication: null, localSettings: null };
+const state = { books: [], chapters: [], selected: null, plans: [], currentPlan: null, publication: null, localSettings: null, platformSnapshot: null };
 const $ = (id) => document.getElementById(id);
 
  document.addEventListener("DOMContentLoaded", async () => {
@@ -28,6 +28,8 @@ function bindEvents() {
   $("autoPublishChapter").addEventListener("click", autoPublishSelected);
   $("reconcileChapter").addEventListener("click", reconcileSelected);
   $("inspectPlatform").addEventListener("click", inspectPlatform);
+  $("smartRunNext").addEventListener("click", smartRunNext);
+  $("smartChapterAction").addEventListener("click", smartProcessSelected);
   $("createPlan").addEventListener("click", createPlan);
   $("approvePlan").addEventListener("click", approvePlan);
   $("runNext").addEventListener("click", runNext);
@@ -128,7 +130,7 @@ function renderChapters() {
   for (const chapter of state.chapters) {
     const item = document.createElement("div");
     item.className = "chapter-item";
-    item.innerHTML = `<strong>第 ${chapter.chapter_no} 章 · ${escapeHtml(chapter.title)}</strong><small>${escapeHtml(chapter.status)} · v${chapter.version} · ${chapter.char_count} 字符</small>`;
+    item.innerHTML = `<strong>第 ${chapter.chapter_no} 章 · ${escapeHtml(chapter.title)}</strong><small>${escapeHtml(chapterStatusLabel(chapter))} · ${chapter.char_count} 字</small>`;
     item.addEventListener("click", async () => {
       document.querySelectorAll(".chapter-item").forEach((node) => node.classList.remove("selected"));
       item.classList.add("selected");
@@ -150,8 +152,11 @@ function renderPreview(chapter) {
   if (!chapter) {
     $("previewTitle").textContent = "未选择章节";
     $("previewStatus").textContent = "—";
+    $("previewStatus").className = "badge neutral";
     $("previewMeta").textContent = "从章节队列选择一章。";
     $("previewBody").textContent = "";
+    $("smartChapterAction").disabled = true;
+    $("smartChapterAction").textContent = "处理本章";
     $("fillChapter").disabled = true;
     $("autoPublishChapter").disabled = true;
     $("reconcileChapter").disabled = true;
@@ -159,9 +164,13 @@ function renderPreview(chapter) {
     return;
   }
   $("previewTitle").textContent = `第 ${chapter.chapter_no} 章 · ${chapter.title}`;
-  $("previewStatus").textContent = chapter.status;
-  $("previewMeta").textContent = `版本 ${chapter.version} · ${chapter.char_count} 字符 · 平台 ${chapter.platform_state || "未登记"} · ${chapter.text_sha256.slice(0, 12)}…`;
+  $("previewStatus").textContent = chapterStatusLabel(chapter);
+  $("previewStatus").className = `badge ${chapterStatusKind(chapter)}`;
+  $("previewMeta").textContent = `第 ${chapter.chapter_no} 章 · ${chapter.char_count} 字 · ${platformStateLabel(chapter.platform_state)}`;
   $("previewBody").textContent = chapter.body;
+  const primary = primaryActionForChapter(chapter);
+  $("smartChapterAction").textContent = primary.label;
+  $("smartChapterAction").disabled = primary.disabled;
   $("fillChapter").disabled = !["ready", "synced", "planned", "fill_started", "filled"].includes(chapter.status);
   $("reconcileChapter").textContent = ["scheduled_unverified", "published_unverified"].includes(chapter.platform_state)
     ? "核对当前番茄章节正文"
@@ -190,21 +199,24 @@ function renderPlan() {
   const plan = state.currentPlan;
   const list = $("planList");
   if (!plan) {
-    $("planBadge").textContent = "未生成";
+    $("planBadge").textContent = "尚未排程";
     $("planBadge").className = "badge neutral";
-    list.textContent = "尚未生成发布计划。";
+    list.textContent = "尚未生成发布排程。";
     $("approvePlan").disabled = true;
     $("runNext").disabled = true;
     return;
   }
-  $("planBadge").textContent = plan.status;
+  $("planBadge").textContent = planStatusLabel(plan.status);
   $("planBadge").className = `badge ${plan.status === "approved" ? "ok" : plan.status === "draft" ? "warn" : "danger"}`;
   const blocked = (plan.items || []).filter((item) => item.status === "blocked");
-  list.innerHTML = `<div class="plan-meta">计划 ${escapeHtml(plan.plan_id.slice(0, 12))}… · 上限 ${plan.daily_limit} · 默认 ${plan.default_slot} · AI ${escapeHtml(plan.ai_policy)}</div>`;
+  list.innerHTML = `<div class="plan-meta">每日上限 ${plan.daily_limit} 字 · 默认 ${plan.default_slot} · ${aiPolicyLabel(plan.ai_policy)}</div>`;
   for (const item of plan.items || []) {
     const row = document.createElement("div");
-    row.className = `plan-item ${item.status === "blocked" ? "blocked" : ""}`;
-    row.textContent = `第 ${item.chapter_no} 章 · ${item.quota_units} 字 · ${item.publication_date || "—"} ${item.publication_time || ""} · ${item.status}${item.reason ? `（${item.reason}）` : ""}`;
+    const kind = item.status === "blocked" ? "blocked" : item.status === "reserved" ? "reserved" : ["adopted", "scheduled", "published"].includes(item.status) ? "done" : "";
+    row.className = `plan-item ${kind}`.trim();
+    const when = item.publication_date ? `${item.publication_date} ${item.publication_time || ""}`.trim() : "日期待定";
+    row.textContent = `第 ${item.chapter_no} 章 · ${item.quota_units} 字 · ${when} · ${planItemLabel(item)}`;
+    if (item.reason) row.title = item.reason;
     list.appendChild(row);
   }
   $("approvePlan").disabled = plan.status !== "draft" || blocked.length > 0;
@@ -214,26 +226,63 @@ function renderPlan() {
 
 async function inspectPlatform() {
   const bookId = $("bookSelect").value;
-  if (!bookId) return setStatus("没有选择作品", "请先选择作品。", "warn");
+  if (!bookId) { setStatus("没有选择作品", "请先选择作品。", "warn"); return null; }
+  const button = $("inspectPlatform");
+  button.disabled = true;
   const all = await send({ type: "getChapters", bookId, status: "", limit: 1000 });
-  if (!all.ok) return setStatus("章节读取失败", all.error, "danger");
+  if (!all.ok) {
+    button.disabled = false;
+    setStatus("章节读取失败", all.error, "danger");
+    return null;
+  }
   const chapterNos = (all.result.chapters || []).map((item) => item.chapter_no);
-  setStatus("正在读取番茄平台状态…", "请先确保当前页面是作品章节管理/发布列表。", "neutral");
+  setStatus("正在刷新番茄状态…", "只读取章节列表，不会修改页面。", "neutral");
   const response = await send({ type: "inspectPlatform", bookId, chapterNos });
-  if (!response.ok) return setStatus("平台对账停止", response.error, "danger");
-  const found = (response.result.snapshot.rows || []).filter((row) => row.scheduled || row.published).length;
+  button.disabled = false;
+  if (!response.ok) {
+    setStatus("无法读取当前页面", "请打开这个作品的章节管理页后再点刷新。", "warn");
+    setActionResult(response.error, "warn");
+    return null;
+  }
+  state.platformSnapshot = response.result.snapshot;
+  renderPlatformSummary();
+  const foundRows = (state.platformSnapshot.rows || []).filter((row) => row.found);
   setStatus(
-    "平台记录读取完成",
-    `识别 ${found} 个已有定时/已发布章节；未核对正文的章节只占用额度，不会被当成同一版本。`,
+    "番茄状态已刷新",
+    `识别到 ${foundRows.length} 个平台章节。蓝色“平台已有”不是错误，插件不会重复提交。`,
     "ok"
   );
-  await connectAndLoad();
+  await loadChapters();
+  await loadPlans();
+  return response.result;
 }
 
-async function createPlan() {
+function renderPlatformSummary() {
+  const element = $("platformSummary");
+  const rows = (state.platformSnapshot?.rows || []).filter((row) => row.found);
+  if (!rows.length) {
+    element.textContent = "当前页面没有识别到章节记录。";
+    element.className = "platform-summary warn";
+    return;
+  }
+  const relevant = rows
+    .filter((row) => row.scheduled || row.published || row.reviewing || row.draft)
+    .sort((a, b) => Number(a.chapterNo) - Number(b.chapterNo));
+  const shown = relevant.slice(-8);
+  element.textContent = shown.map((row) => {
+    const when = row.publicationDate ? ` · ${row.publicationDate}${row.publicationTime ? ` ${row.publicationTime}` : ""}` : "";
+    return `第 ${row.chapterNo} 章 · ${platformRowLabel(row)}${when}`;
+  }).join("\n") || `识别到 ${rows.length} 个章节记录。`;
+  element.className = "platform-summary ok";
+}
+
+async function requestPlan({ announce = true } = {}) {
   const bookId = $("bookSelect").value;
-  if (!bookId) return setStatus("没有选择作品", "请先选择作品。", "warn");
-  setStatus("正在生成发布计划…", "会先扣除已经在番茄确认过的定时任务。", "neutral");
+  if (!bookId) {
+    setStatus("没有选择作品", "请先选择作品。", "warn");
+    return null;
+  }
+  if (announce) setStatus("正在更新发布排程…", "平台已有章节会直接跳过，不会重复创建。", "neutral");
   const response = await send({
     type: "createPlan",
     bookId,
@@ -244,11 +293,118 @@ async function createPlan() {
       start_date: $("planStartDate").value || localDateString()
     }
   });
-  if (!response.ok) return setStatus("生成计划失败", response.error, "danger");
+  if (!response.ok) {
+    setStatus("无法生成排程", friendlyError(response.error), "danger");
+    return null;
+  }
   state.currentPlan = response.result;
   state.plans = [response.result, ...state.plans.filter((plan) => plan.plan_id !== response.result.plan_id)];
   renderPlan();
-  setStatus("计划已生成", "请检查日期、字数和 AI 策略；确认无阻塞项后再批准。", "ok");
+  if (announce) {
+    const blockers = (response.result.items || []).filter((item) => item.status === "blocked");
+    setStatus(
+      blockers.length ? "排程需要处理" : "排程已更新",
+      blockers.length ? blockerInstruction(blockers[0]) : "已有平台记录已自动跳过，可以直接处理下一章。",
+      blockers.length ? "warn" : "ok"
+    );
+  }
+  return response.result;
+}
+
+async function createPlan() {
+  await requestPlan({ announce: true });
+}
+
+async function smartRunNext() {
+  const button = $("smartRunNext");
+  button.disabled = true;
+  const page = await send({ type: "inspectActivePage" });
+  if (!page.ok || page.result?.state !== "writer") {
+    button.disabled = false;
+    setStatus("请先打开章节管理页", "打开当前作品的章节管理列表，再点击“自动处理下一章”。", "warn");
+    return;
+  }
+  const refreshed = await inspectPlatform();
+  if (!refreshed) { button.disabled = false; return; }
+  await prepareAndRun(null);
+  button.disabled = false;
+}
+
+async function smartProcessSelected() {
+  if (!state.selected) return;
+  const chapter = state.selected;
+  if (chapter.status === "awaiting_ai_choice") {
+    const item = currentPlanItem(chapter.chapter_no);
+    if (state.currentPlan?.status === "approved" && item?.status === "awaiting_ai_choice") {
+      await runAutomation(item);
+    } else {
+      setActionResult("请保留原来的番茄发布设置页，并从高级工具中的已有排程继续。", "warn");
+    }
+    return;
+  }
+  const needsReconciliation = chapter.status === "legacy_draft" || ["scheduled_unverified", "published_unverified", "draft_unverified"].includes(chapter.platform_state);
+  if (needsReconciliation) {
+    await reconcileSelected();
+    return;
+  }
+  if (["scheduled", "published", "verified", "legacy_published"].includes(chapter.status) || ["scheduled", "published"].includes(chapter.platform_state)) {
+    setActionResult(`第 ${chapter.chapter_no} 章在番茄已有记录，无需重复处理。`, "ok");
+    return;
+  }
+  // When invoked from the management list, refresh first so a chapter manually
+  // submitted moments ago is reserved instead of being created again.
+  const page = await send({ type: "inspectActivePage" });
+  if (page.ok && page.result?.state === "writer") {
+    const refreshed = await inspectPlatform();
+    if (!refreshed) return;
+  }
+  await prepareAndRun(chapter.chapter_no);
+}
+
+async function prepareAndRun(chapterNo) {
+  const primaryButton = chapterNo ? $("smartChapterAction") : $("smartRunNext");
+  primaryButton.disabled = true;
+  setActionResult("正在计算额度和发布日期…", "neutral");
+  const plan = await requestPlan({ announce: false });
+  if (!plan) { primaryButton.disabled = false; return; }
+  const blocker = (plan.items || []).find((item) => item.status === "blocked");
+  if (blocker) {
+    const instruction = blockerInstruction(blocker);
+    setActionResult(instruction, "warn");
+    setStatus("先处理一个问题", instruction, "warn");
+    primaryButton.disabled = false;
+    return;
+  }
+  const item = chapterNo
+    ? (plan.items || []).find((entry) => Number(entry.chapter_no) === Number(chapterNo))
+    : (plan.items || []).find((entry) => entry.status === "planned");
+  if (!item) {
+    const message = chapterNo ? `第 ${chapterNo} 章已在番茄存在或已经处理。` : "没有需要新建或继续发布的章节。";
+    setActionResult(message, "ok");
+    setStatus("无需重复处理", message, "ok");
+    primaryButton.disabled = false;
+    return;
+  }
+  if (["reserved", "adopted", "scheduled", "published"].includes(item.status)) {
+    const message = `第 ${item.chapter_no} 章在番茄已有记录，插件已跳过。`;
+    setActionResult(message, "ok");
+    setStatus("无需重复处理", message, "ok");
+    primaryButton.disabled = false;
+    return;
+  }
+  const approved = await send({ type: "approvePlan", planId: plan.plan_id });
+  if (!approved.ok) {
+    const message = friendlyError(approved.error);
+    setActionResult(message, "danger");
+    setStatus("排程无法执行", message, "danger");
+    primaryButton.disabled = false;
+    return;
+  }
+  state.currentPlan = approved.result;
+  renderPlan();
+  const approvedItem = currentPlanItem(item.chapter_no);
+  await runAutomation(approvedItem);
+  primaryButton.disabled = false;
 }
 
 async function approvePlan() {
@@ -379,3 +535,119 @@ function setConnection(ok) { const badge = $("connectionBadge"); badge.textConte
 function setStatus(title, detail, kind) { $("statusTitle").textContent = title; $("statusDetail").textContent = detail; const panel = document.querySelector(".status-panel"); panel.className = `panel status-panel ${kind === "danger" ? "error" : kind === "ok" ? "success" : ""}`; }
 function send(payload) { return new Promise((resolve) => { chrome.runtime.sendMessage(payload, (response) => { if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message }); else resolve(response || { ok: false, error: "扩展后台没有响应。" }); }); }); }
 function escapeHtml(value) { return String(value || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
+
+function chapterStatusLabel(chapter) {
+  if (["scheduled_unverified", "published_unverified", "draft_unverified"].includes(chapter.platform_state)) return "平台已有，待核对";
+  const labels = {
+    ready: "待发布",
+    synced: "待发布",
+    planned: "已排程",
+    fill_started: "编辑页处理中",
+    filled: "已填入，待继续",
+    legacy_draft: "旧草稿，待核对",
+    legacy_published: "已发布",
+    scheduled: "已定时",
+    published: "已发布",
+    verified: "已核对",
+    awaiting_ai_choice: "等待选择 AI",
+    submitted: "已提交，待确认",
+    blocked: "需要人工确认",
+    version_conflict: "内容冲突",
+    saved_draft: "平台草稿"
+  };
+  return labels[chapter.status] || "待确认";
+}
+
+function chapterStatusKind(chapter) {
+  if (["scheduled", "published", "verified", "legacy_published"].includes(chapter.status)) return "ok";
+  if (chapter.status === "version_conflict" || chapter.status === "blocked") return "danger";
+  if (["filled", "fill_started", "legacy_draft"].includes(chapter.status) || String(chapter.platform_state || "").endsWith("_unverified")) return "warn";
+  return "neutral";
+}
+
+function platformStateLabel(value) {
+  const labels = {
+    scheduled_unverified: "番茄已有定时/审核记录，正文待核对",
+    published_unverified: "番茄已有发布记录，正文待核对",
+    draft_unverified: "番茄已有草稿，正文待核对",
+    scheduled: "番茄已定时",
+    published: "番茄已发布",
+    submitted_unverified: "番茄已接收提交，结果待核对",
+    submitted: "番茄已接收提交",
+    saved_draft: "番茄已有草稿"
+  };
+  return labels[value] || "番茄尚未登记";
+}
+
+function primaryActionForChapter(chapter) {
+  if (chapter.status === "legacy_draft" || ["scheduled_unverified", "published_unverified", "draft_unverified"].includes(chapter.platform_state)) {
+    return { label: "核对当前番茄章节", disabled: false };
+  }
+  if (["scheduled", "published", "verified", "legacy_published"].includes(chapter.status) || ["scheduled", "published"].includes(chapter.platform_state)) {
+    return { label: "本章已处理", disabled: true };
+  }
+  if (["filled", "fill_started"].includes(chapter.status)) return { label: "继续发布本章", disabled: false };
+  if (["ready", "synced", "planned"].includes(chapter.status)) return { label: "自动发布本章", disabled: false };
+  if (chapter.status === "awaiting_ai_choice") return { label: "AI 已选择，继续发布", disabled: false };
+  return { label: "需要人工确认", disabled: true };
+}
+
+function planStatusLabel(status) {
+  return { draft: "待确认", approved: "执行中", completed: "已完成", blocked: "需处理" }[status] || "待确认";
+}
+
+function aiPolicyLabel(policy) {
+  return { remember: "AI 选项沿用上次", use: "声明使用 AI", no: "声明未使用 AI", ask: "每章手动选择 AI" }[policy] || "AI 选项待确认";
+}
+
+function planItemLabel(item) {
+  if (item.status === "reserved") return "平台已有，自动跳过";
+  if (item.status === "adopted") return "平台记录已核对";
+  if (item.status === "planned" && item.reason === "resume_current_editor") return "从当前编辑页继续";
+  if (item.status === "planned") return "待自动发布";
+  if (item.status === "blocked") return blockerReasonLabel(item.reason);
+  return {
+    awaiting_ai_choice: "等待选择 AI",
+    submitted: "已提交，待平台确认",
+    scheduled: "已定时",
+    published: "已发布"
+  }[item.status] || "待确认";
+}
+
+function blockerReasonLabel(reason) {
+  const exact = {
+    existing_schedule_version_conflict: "平台正文与本地版本冲突",
+    empty_chapter: "章节正文为空",
+    chapter_exceeds_daily_limit: "单章超过每日 9999 字上限",
+    resume_editor_required: "请打开已填充的编辑页",
+    resume_editor_content_mismatch: "当前编辑页内容不一致"
+  };
+  if (exact[reason]) return exact[reason];
+  if (String(reason || "").startsWith("platform_state:")) return "平台已有未核对记录";
+  if (String(reason || "").startsWith("chapter_status:legacy_draft")) return "先打开并核对旧草稿";
+  if (String(reason || "").startsWith("chapter_status:version_conflict")) return "先解决正文版本冲突";
+  if (String(reason || "").startsWith("chapter_status:blocked")) return "先核对上次停止的结果";
+  return "需要人工确认后再继续";
+}
+
+function blockerInstruction(item) {
+  return `先处理第 ${item.chapter_no} 章：${blockerReasonLabel(item.reason)}。`;
+}
+
+function platformRowLabel(row) {
+  if (row.published) return "已发布";
+  if (row.reviewing) return "审核中";
+  if (row.scheduled) return "待发布";
+  if (row.draft) return "草稿";
+  return "平台已有";
+}
+
+function friendlyError(error) {
+  const value = String(error || "未知错误");
+  const labels = {
+    plan_contains_blocked_items: "排程中还有必须先处理的章节。",
+    no_plannable_chapters: "当前没有需要排程的章节。",
+    daily_limit_exceeds_configured_safety_cap: "每日上限不能超过 9999 字。"
+  };
+  return labels[value] || value;
+}

@@ -6,12 +6,13 @@ const DEFAULT_SETTINGS = {
   automationEnabled: false,
   selectedSlot: "20:00",
   aiPolicy: "remember",
-  aiChoiceByBook: {}
+  aiChoiceByBook: {},
+  platformWorkIdByBook: {}
 };
 const TARGET_ROOT_HOST = "fanqienovel.com";
 const WRITER_URL = "https://fanqienovel.com/main/writer/";
 const AUTOMATION_ALARM = "ainovel-publication-runner";
-const AUTOMATION_SAFETY_EPOCH = "0.2.0-live-selector-validation";
+const AUTOMATION_SAFETY_EPOCH = "0.3.0-simplified-safe-flow";
 let automationLock = false;
 const safetyReady = enforceAutomationSafetyEpoch();
 
@@ -96,6 +97,10 @@ async function handleMessage(message) {
       return reconcileChapter(message.bookId, Number(message.chapterNo));
     case "inspectPlatform":
       return inspectPlatform(message.bookId, message.chapterNos || []);
+    case "inspectActivePage": {
+      const tab = await currentFanqieTab();
+      return sendPageAction(tab.id, { type: "inspectPage" });
+    }
     case "automateChapter":
       return automateChapter(message.bookId, Number(message.chapterNo), message.planId);
     case "continueManualAi":
@@ -171,6 +176,7 @@ async function fillChapter(bookId, chapterNo) {
     throw new Error(`章节状态 ${chapter.status} 不允许直接填充。`);
   }
   const tab = await currentFanqieTab();
+  await rememberPlatformWorkId(bookId, tab.url);
   const response = await sendPageAction(tab.id, {
     type: "fillChapter",
     chapter: chapterPayload(chapter)
@@ -195,6 +201,7 @@ async function automateChapter(bookId, chapterNo, planId) {
   if (automationLock) throw new Error("已有自动发布任务正在运行。");
   automationLock = true;
   let activeChapter = null;
+  let pageMutationStarted = false;
   try {
     if (!planId) throw new Error("自动发布必须绑定已批准的发布计划。");
     const [chapter, plan] = await Promise.all([
@@ -205,14 +212,21 @@ async function automateChapter(bookId, chapterNo, planId) {
     const bookCatalog = await apiRequest("/api/v1/books");
     const expectedBook = (bookCatalog.books || []).find((entry) => entry.book_id === bookId);
     if (!expectedBook) throw new Error("本地账本中没有找到目标作品。");
+    const expectedWorkId = await platformWorkIdForBook(bookId);
     if (plan.status !== "approved") throw new Error(`发布计划状态 ${plan.status} 不允许执行。`);
     const item = (plan.items || []).find((entry) => Number(entry.chapter_no) === chapterNo);
     if (!item) throw new Error("发布计划中没有目标章节。");
-    if (item.status === "adopted") return { ok: true, adopted: true, item };
+    if (["adopted", "reserved"].includes(item.status)) {
+      return { ok: true, adopted: true, reserved: item.status === "reserved", item };
+    }
     if (item.status !== "planned") throw new Error(`计划项状态 ${item.status} 不允许执行。`);
-    if (!["ready", "synced", "planned"].includes(chapter.status)) {
+    const resumeCurrentEditor = item.reason === "resume_current_editor" || ["fill_started", "filled"].includes(chapter.status);
+    const allowedChapterStates = resumeCurrentEditor
+      ? ["fill_started", "filled", "planned"]
+      : ["ready", "synced", "planned"];
+    if (!allowedChapterStates.includes(chapter.status)) {
       throw automationFailure(
-        `章节账本状态 ${chapter.status} 不允许创建新章节，必须先对账。`,
+        `第 ${chapterNo} 章当前不能安全继续，请先刷新番茄状态。`,
         "chapter_state_requires_reconciliation",
         { chapterStatus: chapter.status, platformState: chapter.platform_state || null }
       );
@@ -228,8 +242,11 @@ async function automateChapter(bookId, chapterNo, planId) {
       throw automationFailure("发布计划版本与当前服务器版本不一致，已停止。", "stale_plan_item_version");
     }
 
-    const tab = await createAutomationWriterTab();
-    const page = await sendPageAction(tab.id, { type: "inspectPage", bookName: expectedBook.name });
+    const tab = resumeCurrentEditor
+      ? await findMatchingEditorTab(chapter, expectedWorkId)
+      : await ensureWriterTab(expectedWorkId);
+    const identity = { bookName: expectedWorkId ? null : expectedBook.name, workId: expectedWorkId };
+    const page = await sendPageAction(tab.id, { type: "inspectPage", ...identity });
     if (!page?.ok || page.state === "login_required") {
       throw automationFailure("番茄登录状态无效，请先在 Edge 中登录后再继续。", "login_required", page);
     }
@@ -241,13 +258,31 @@ async function automateChapter(bookId, chapterNo, planId) {
     }
 
     let editorTab = tab;
-    if (page.state !== "editor") {
+    if (resumeCurrentEditor) {
+      if (page.state !== "editor") {
+        throw automationFailure(
+          `第 ${chapterNo} 章已经填过。请打开它仍保留内容的番茄编辑页，再点“继续发布本章”。`,
+          "resume_editor_required",
+          page
+        );
+      }
+      const existing = await sendPageAction(tab.id, { type: "inspectChapter", chapter: chapterPayload(chapter) });
+      if (!existing?.ok || !existing.titleMatches || !existing.bodyMatches || !existing.chapterMatches) {
+        throw automationFailure(
+          "当前编辑页不是这一本地章节的完整内容，已停止且不会新建重复章节。",
+          "resume_editor_content_mismatch",
+          existing
+        );
+      }
+    } else if (page.state !== "editor") {
       const beforeIds = new Set((await chrome.tabs.query({ currentWindow: true })).map((entry) => entry.id));
-      const opened = await sendPageAction(tab.id, { type: "openNewChapter", bookName: expectedBook.name });
+      // Clicking “new chapter” may create a draft even if the following response is lost.
+      pageMutationStarted = true;
+      const opened = await sendPageAction(tab.id, { type: "openNewChapter", ...identity });
       if (!opened?.ok) {
         throw automationFailure(opened?.error || "打开新建章节失败。", opened?.code || "new_chapter_failed", opened);
       }
-      editorTab = await waitForEditorTab(beforeIds, 20_000);
+      editorTab = await waitForEditorTab(beforeIds, 20_000, expectedWorkId);
     }
 
     await safePostEvent(bookId, chapterNo, "automation_started", chapter.text_sha256, {
@@ -255,6 +290,7 @@ async function automateChapter(bookId, chapterNo, planId) {
       publication_time: item.publication_time, quota_units: item.quota_units
     });
 
+    pageMutationStarted = true;
     const filled = await sendPageAction(editorTab.id, { type: "fillChapter", chapter: chapterPayload(chapter) });
     if (!filled?.ok) throw automationFailure(filled?.error || "自动填充失败。", filled?.code || "fill_failed", filled);
     await safePostEvent(bookId, chapterNo, "filled", chapter.text_sha256, {
@@ -265,7 +301,7 @@ async function automateChapter(bookId, chapterNo, planId) {
     if (!next?.ok) throw automationFailure(next?.error || "点击下一步前校验失败。", next?.code || "next_failed", next);
     await safePostEvent(bookId, chapterNo, "next_clicked", chapter.text_sha256, { plan_id: planId });
 
-    const postNextTab = await waitForPublicationTab(editorTab.id, 20_000);
+    const postNextTab = await waitForPublicationTab(editorTab.id, 20_000, expectedWorkId);
     const resolvedAiPolicy = await resolveAiPolicy(bookId, plan.ai_policy);
     const publication = await sendPageAction(postNextTab.id, {
       type: "completePublicationFlow",
@@ -299,9 +335,17 @@ async function automateChapter(bookId, chapterNo, planId) {
     }
     return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, publication);
   } catch (error) {
-    if (activeChapter) {
+    if (activeChapter && pageMutationStarted) {
       await markBlocked(bookId, chapterNo, planId, activeChapter.text_sha256, error.code || "automation_blocked", {
         message: normalizeError(error),
+        details: error.details || null
+      });
+    } else if (activeChapter) {
+      await safePostEvent(bookId, chapterNo, "failed", activeChapter.text_sha256, {
+        plan_id: planId,
+        error: error.code || normalizeError(error),
+        message: normalizeError(error),
+        stage: "pre_mutation_check",
         details: error.details || null
       });
     }
@@ -331,7 +375,8 @@ async function continueManualAi(bookId, chapterNo, planId) {
       throw automationFailure("等待期间章节版本已变化，已停止。", "stale_plan_item_version");
     }
 
-    const postNextTab = await findPublicationSettingsTab();
+    const expectedWorkId = await platformWorkIdForBook(bookId);
+    const postNextTab = await findPublicationSettingsTab(expectedWorkId);
     const publication = await sendPageAction(postNextTab.id, {
       type: "completePublicationFlow",
       options: {
@@ -433,18 +478,16 @@ async function runApprovedPlanItems() {
   return { skipped: true, reason: "no_approved_items" };
 }
 
-async function createAutomationWriterTab() {
-  const created = await chrome.tabs.create({ url: WRITER_URL, active: true });
-  await waitForTabComplete(created.id, 30_000);
-  return chrome.tabs.get(created.id);
-}
-
-async function ensureWriterTab() {
+async function ensureWriterTab(expectedWorkId = null) {
   const tabs = await chrome.tabs.query({ currentWindow: true });
-  const active = tabs.find((tab) => tab.active && tab.id && isFanqieUrl(tab.url));
-  const existing = active || tabs.find((tab) => tab.id && isFanqieUrl(tab.url));
+  const matching = (tab) => tab.id && isFanqieUrl(tab.url) && (!expectedWorkId || extractPlatformWorkId(tab.url) === expectedWorkId);
+  const active = tabs.find((tab) => tab.active && matching(tab));
+  const existing = active || tabs.find(matching);
   if (existing) return existing;
-  const created = await chrome.tabs.create({ url: WRITER_URL, active: true });
+  const url = expectedWorkId
+    ? `https://fanqienovel.com/main/writer/chapter-manage/${expectedWorkId}?type=1`
+    : WRITER_URL;
+  const created = await chrome.tabs.create({ url, active: true });
   await waitForTabComplete(created.id, 30_000);
   return chrome.tabs.get(created.id);
 }
@@ -455,11 +498,33 @@ async function currentFanqieTab() {
   return tab;
 }
 
-async function waitForEditorTab(beforeIds, timeoutMs) {
+async function findMatchingEditorTab(chapter, expectedWorkId = null) {
+  const tabs = await chrome.tabs.query({ currentWindow: true });
+  const ordered = [...tabs.filter((tab) => tab.active), ...tabs.filter((tab) => !tab.active)];
+  for (const tab of ordered) {
+    if (!tab.id || !isFanqieUrl(tab.url)) continue;
+    if (expectedWorkId && extractPlatformWorkId(tab.url) !== expectedWorkId) continue;
+    try {
+      const page = await sendPageAction(tab.id, { type: "inspectPage", workId: expectedWorkId });
+      if (page?.state !== "editor") continue;
+      const inspected = await sendPageAction(tab.id, { type: "inspectChapter", chapter: chapterPayload(chapter) });
+      if (inspected?.ok && inspected.titleMatches && inspected.bodyMatches && inspected.chapterMatches) return tab;
+    } catch (_error) { /* inspect the next local Fanqie tab */ }
+  }
+  throw automationFailure(
+    `没有找到仍保留第 ${chapter.chapter_no} 章完整内容的番茄编辑页。请打开该编辑页后再继续。`,
+    "resume_editor_required"
+  );
+}
+
+async function waitForEditorTab(beforeIds, timeoutMs, expectedWorkId = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const tabs = await chrome.tabs.query({ currentWindow: true });
-    const candidates = tabs.filter((tab) => tab.id && isFanqieUrl(tab.url) && (!beforeIds.has(tab.id) || tab.active));
+    const candidates = tabs.filter((tab) => (
+      tab.id && isFanqieUrl(tab.url) && (!expectedWorkId || extractPlatformWorkId(tab.url) === expectedWorkId) &&
+      (!beforeIds.has(tab.id) || tab.active)
+    ));
     for (const tab of candidates) {
       try {
         await waitForTabComplete(tab.id, 5_000);
@@ -472,11 +537,11 @@ async function waitForEditorTab(beforeIds, timeoutMs) {
   throw new Error("新建章节后未找到可验证的编辑页。");
 }
 
-async function waitForPublicationTab(editorTabId, timeoutMs) {
+async function waitForPublicationTab(editorTabId, timeoutMs, expectedWorkId = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const tabs = await chrome.tabs.query({ currentWindow: true });
-    const candidates = tabs.filter((tab) => tab.id && isFanqieUrl(tab.url));
+    const candidates = tabs.filter((tab) => tab.id && isFanqieUrl(tab.url) && (!expectedWorkId || extractPlatformWorkId(tab.url) === expectedWorkId));
     for (const tab of candidates) {
       try {
         const page = await sendPageAction(tab.id, { type: "inspectPage" });
@@ -495,13 +560,14 @@ async function waitForPublicationTab(editorTabId, timeoutMs) {
   throw new Error("下一步后未找到可验证的发布设置页面。");
 }
 
-async function findPublicationSettingsTab() {
+async function findPublicationSettingsTab(expectedWorkId = null) {
   const tabs = await chrome.tabs.query({ currentWindow: true });
   const ordered = [...tabs.filter((tab) => tab.active), ...tabs.filter((tab) => !tab.active)];
   for (const tab of ordered) {
     if (!tab.id || !isFanqieUrl(tab.url)) continue;
+    if (expectedWorkId && extractPlatformWorkId(tab.url) !== expectedWorkId) continue;
     try {
-      const page = await sendPageAction(tab.id, { type: "inspectPage" });
+      const page = await sendPageAction(tab.id, { type: "inspectPage", workId: expectedWorkId });
       if (page?.state === "publish_settings") return tab;
     } catch (_error) { /* inspect the next Fanqie tab */ }
   }
@@ -537,6 +603,7 @@ async function inspectPlatform(bookId, chapterNos) {
   const tab = await ensureWriterTab();
   const snapshot = await sendPageAction(tab.id, { type: "inspectPublicationList", chapterNos });
   if (!snapshot?.ok) throw new Error(snapshot?.error || "读取平台章节列表失败。");
+  await rememberPlatformWorkId(bookId, snapshot.url || tab.url);
   const publicationSettings = await apiRequest("/api/v1/settings/publication");
   const observations = [];
   const recordObservations = [];
@@ -698,6 +765,33 @@ async function postEvent(bookId, chapterNo, event, textSha256, payload) {
   return apiRequest(`/api/v1/books/${encodeURIComponent(bookId)}/chapters/${chapterNo}/events`, {
     method: "POST", body: { event, text_sha256: textSha256, payload: payload || {} }
   });
+}
+
+function extractPlatformWorkId(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    const managed = pathname.match(/\/main\/writer\/chapter-manage\/(\d{10,})/u);
+    if (managed) return managed[1];
+    const workRoot = pathname.match(/\/main\/writer\/(\d{10,})(?:\/|$)/u);
+    return workRoot ? workRoot[1] : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function rememberPlatformWorkId(bookId, url) {
+  const workId = extractPlatformWorkId(url);
+  if (!bookId || !workId) return null;
+  const stored = await chrome.storage.local.get({ platformWorkIdByBook: {} });
+  await chrome.storage.local.set({
+    platformWorkIdByBook: { ...(stored.platformWorkIdByBook || {}), [bookId]: workId }
+  });
+  return workId;
+}
+
+async function platformWorkIdForBook(bookId) {
+  const stored = await chrome.storage.local.get({ platformWorkIdByBook: {} });
+  return stored.platformWorkIdByBook?.[bookId] || null;
 }
 
 function isFanqieUrl(url) {

@@ -289,3 +289,95 @@ def test_publication_list_does_not_borrow_adjacent_chapter_date():
         assert result["rows"][1]["scheduled"] is True
         assert result["rows"][1]["publicationDate"] == "2026-07-25"
         browser.close()
+
+
+def test_fill_waits_for_async_editor_mount_instead_of_requiring_second_click():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <!doctype html><html><body>
+          <div id="app"></div>
+          <script>
+            window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};
+            setTimeout(() => {
+              document.getElementById('app').innerHTML = `
+                <input class="serial-input" style="width:100px;height:30px">
+                <input class="serial-editor-input-hint-area" style="width:400px;height:30px">
+                <div class="ProseMirror" contenteditable="true" style="width:800px;height:500px"></div>`;
+            }, 350);
+          </script>
+        </body></html>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke(page, {
+            "chapter_no": 6,
+            "title": "第六章 夜话",
+            "body": "第一段。\n\n第二段。",
+            "text_sha256": "f" * 64,
+            "char_count": 8,
+        })
+        assert result["ok"] is True
+        assert page.locator(".serial-editor-input-hint-area").input_value() == "夜话"
+        rendered = page.locator(".ProseMirror").inner_text()
+        assert "第一段。" in rendered and "第二段。" in rendered
+        browser.close()
+
+
+def test_realistic_chapter_table_keeps_reviewing_row_isolated_from_published_neighbours():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <main><h1>章节管理</h1>
+          <div class="chapter-table">
+            <div class="data-row"><span>第6章 夜话</span><span>-</span><span>0</span><span>审核中</span><span>2026-07-24 07:10</span></div>
+            <div class="data-row"><span>第5章 来客</span><span>7712</span><span>0</span><span>待发布</span><span>2026-07-23 07:10</span></div>
+            <div class="data-row"><span>第4章 灵核</span><span>3388</span><span>0</span><span>已发布</span><span>2026-07-22 21:02</span></div>
+          </div>
+          <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
+        </main>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "inspectPublicationList", "chapterNos": [4, 5, 6]})
+        rows = {row["chapterNo"]: row for row in result["rows"]}
+        assert rows[6]["reviewing"] is True
+        assert rows[6]["scheduled"] is True
+        assert rows[6]["published"] is False
+        assert rows[6]["publicationDate"] == "2026-07-24"
+        assert rows[6]["publicationTime"] == "07:10"
+        assert "第5章" not in rows[6]["text"]
+        assert "已发布" not in rows[6]["text"]
+        assert rows[5]["scheduled"] is True
+        assert rows[5]["published"] is False
+        assert rows[4]["published"] is True
+        browser.close()
+
+
+def test_stable_platform_work_id_allows_local_and_fanqie_titles_to_differ():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.route(
+            "https://fanqienovel.com/**",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/html",
+                body="""
+                <main><h1>章节管理</h1><p>空脉废体，天道求我别填了</p></main>
+                <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
+                """,
+            ),
+        )
+        page.goto("https://fanqienovel.com/main/writer/chapter-manage/7664986207666850841&title?type=1")
+        page.add_script_tag(path=str(SCRIPT))
+        matched = invoke_action(page, {
+            "type": "inspectPage",
+            "bookName": "尘尽天开",
+            "workId": "7664986207666850841",
+        })
+        assert matched["workMatches"] is True
+        assert matched["currentWorkId"] == "7664986207666850841"
+        mismatch = invoke_action(page, {"type": "inspectPage", "workId": "7999999999999999999"})
+        assert mismatch["workMatches"] is False
+        browser.close()

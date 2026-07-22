@@ -99,7 +99,7 @@ Every state has a timeout, evidence snapshot, and terminal `blocked` outcome. A 
 
 1. **Done:** planner-only mode and fixture-tested state machine.
 2. **Done:** fill-only behavior retained; automation defaults to off.
-3. **Next:** install version 0.2.0 and read the existing fourth/fifth schedule rows.
+3. **Completed:** installed version 0.2.0 and read the live chapter rows. The trial exposed asynchronous editor mounting and adjacent-row classification risks.
 4. **Next:** open those scheduled chapters and match chapter number, title, and body before adoption.
 5. **Next:** run one non-critical future chapter with automation still manually triggered.
 6. **Then:** enable automatic execution for later approved plan items.
@@ -113,3 +113,8 @@ Every state has a timeout, evidence snapshot, and terminal `blocked` outcome. A 
 - A real run is successful only when Fanqie read-back confirms the intended chapter version and future slot.
 
 Current automated suite: 43 unit/browser tests. The restart fault-injection test and real Fanqie acceptance run remain rollout gates, not assumed successes.
+
+
+## 2026-07-22 live-trial simplification
+
+Version 0.3.0 implements ADR 0011. The default UI now exposes only refresh and process actions. Existing platform rows reserve quota without becoming global failures, filled editors resume only after an exact local-version check, and the adapter waits for asynchronous editor mounting and controlled-state settlement. Real chapter-list evidence (`审核中`, `待发布`, `已发布`) is isolated per row.

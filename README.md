@@ -9,7 +9,7 @@ The system separates four responsibilities because they have different trust and
 1. **Server exporter** — turns canonical completed Markdown chapters into deterministic release artifacts and a SHA256 manifest.
 2. **Windows companion** — owns SSH/SFTP access, local chapter cache, SQLite publishing ledger, quota-aware publication plans, and the authenticated localhost API.
 3. **Browser extension** — owns the local logged-in Edge session, page/state recognition, editor interaction, publication settings, and read-back verification.
-4. **Human operator** — approves a publication plan, handles login/CAPTCHA/risk-control or unknown states, and resolves version conflicts. Known planned steps may then run automatically.
+4. **Human operator** — chooses the chapter/action, handles login/CAPTCHA/risk-control or unknown states, and resolves real version conflicts. The primary action creates and approves a conflict-free plan automatically; advanced manual controls remain available.
 
 ```text
 Ainovel source chapters
@@ -26,7 +26,7 @@ Ainovel source chapters
 
 ## Current status
 
-Version `0.2.0` implements the quota planner, durable publication plans, platform reconciliation, explicit browser state machine, manual-AI pause, scheduled submission, read-back verification, and fail-closed blocking. Automatic execution defaults to **off** until the live Fanqie selectors are validated on the installed Edge profile. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for the staged rollout and [`docs/plan-boundaries.md`](docs/plan-boundaries.md) for the confirmed grill-with-docs boundaries.
+Version `0.3.0` adds a checkpoint-driven one-button workflow: existing platform rows are safely reserved instead of shown as global failures, filled editors can resume after an exact content check, and asynchronous Fanqie editors are awaited instead of requiring a second click. It retains the quota planner, durable plans, manual-AI pause, scheduled submission, read-back verification, and fail-closed safety boundaries. Automatic execution defaults to **off** until the live Fanqie selectors are validated on the installed Edge profile. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for the staged rollout and [`docs/plan-boundaries.md`](docs/plan-boundaries.md) for the confirmed grill-with-docs boundaries.
 
 ## Repository layout
 
@@ -57,14 +57,14 @@ See [`companion/README.md`](companion/README.md). Initialize it, edit the genera
 
 ### 3. Load the extension
 
-See [`extension/README.md`](extension/README.md). Load `extension/` as an unpacked extension in Edge or Chrome, enter the localhost API token, reconcile existing platform schedules, generate and approve a plan, and keep automatic execution off until one manually triggered live run passes.
+See [`extension/README.md`](extension/README.md). Load `extension/` as an unpacked extension in Edge or Chrome, enter the localhost API token, refresh the platform chapter list, use the primary action for one live chapter, and keep background automatic execution off until that run passes.
 
 ## Safety boundaries
 
 - One server, one workstation, one account, one work, and one chapter version per automation run.
 - Existing title/body content, drafts, schedules, and published chapters are never silently overwritten or duplicated.
 - Publication plans cannot exceed the configured safety cap (currently 9,999 units) and offer selectable 12:00/20:00/22:00 Asia/Shanghai slots.
-- A chapter-list schedule reserves quota but is not treated as the current source version until title/body reconciliation succeeds.
+- A chapter-list row reserves quota and is skipped without duplicate submission; it is not claimed as the current source version until title/body reconciliation succeeds.
 - Source-version conflicts, quota ambiguity, unknown page states, login expiry, CAPTCHA, and risk-control prompts stop the run.
 - A click is never recorded as success until Fanqie read-back verifies the intended chapter and schedule/publication state.
 - Credentials and browser login state remain local; the server never operates the Fanqie browser session.

@@ -10,7 +10,7 @@
   <header>
     <div>
       <h1>Ainovel 发布助手</h1>
-      <p>先对账和排程，再按计划逐章自动定时发布。</p>
+      <p>刷新一次平台状态，然后只需选择章节并点击“处理本章”。</p>
     </div>
     <span id="connectionBadge" class="badge neutral">未连接</span>
   </header>
@@ -62,21 +62,28 @@
   </section>
 
   <section class="panel plan-panel">
-    <div class="section-title"><h2>额度排程</h2><span id="planBadge" class="badge neutral">未生成</span></div>
-    <div class="settings-grid">
-      <label>计划起始日期<input id="planStartDate" type="date"></label>
-      <label>计划说明<input id="planSummary" readonly value="先读取平台已有定时任务"></label>
+    <div class="section-title"><h2>发布控制台</h2><span id="planBadge" class="badge neutral">尚未排程</span></div>
+    <div class="row primary-actions">
+      <button id="inspectPlatform" class="secondary">刷新番茄状态</button>
+      <button id="smartRunNext">自动处理下一章</button>
     </div>
-    <div class="row wrap">
-      <button id="inspectPlatform" class="secondary">读取平台定时任务</button>
-      <button id="createPlan">生成发布计划</button>
-      <button id="approvePlan" class="secondary" disabled>批准当前计划</button>
-      <button id="runNext" disabled>执行计划下一章</button>
-    </div>
-    <div id="planList" class="plan-list">尚未生成发布计划。</div>
-    <p class="warning">计划按实际发布日期计算 9999 字上限；未知页面、额度拒绝或版本冲突会停止，不会重复提交。</p>
-  </section>
+    <div id="platformSummary" class="platform-summary neutral">先在番茄章节管理页刷新一次状态。</div>
+    <p class="safe-note">平台已有的章节只占用额度，不会重复提交；只有真正冲突才会停止。</p>
 
+    <details class="advanced-panel">
+      <summary>高级：查看和手动调整排程</summary>
+      <div class="settings-grid">
+        <label>计划起始日期<input id="planStartDate" type="date"></label>
+        <label>计划说明<input id="planSummary" readonly value="自动避开平台已有章节"></label>
+      </div>
+      <div class="row wrap">
+        <button id="createPlan">更新排程</button>
+        <button id="approvePlan" class="secondary" disabled>批准排程</button>
+        <button id="runNext" disabled>执行下一章</button>
+      </div>
+      <div id="planList" class="plan-list">尚未生成发布排程。</div>
+    </details>
+  </section>
   <main>
     <section class="panel list-panel">
       <div class="section-title"><h2>章节队列</h2><span id="queueCount">0</span></div>
@@ -87,12 +94,16 @@
       <div class="section-title"><h2 id="previewTitle">未选择章节</h2><span id="previewStatus" class="badge neutral">—</span></div>
       <p id="previewMeta" class="muted">从左侧队列选择一章。</p>
       <pre id="previewBody"></pre>
-      <button id="reconcileChapter" class="secondary" disabled>对账当前番茄草稿</button>
-      <button id="fillChapter" disabled>填充到当前番茄编辑页</button>
-      <button id="autoPublishChapter" disabled>按当前计划自动定时发布</button>
-      <button id="resumeBlocked" class="secondary" disabled>核对平台后解除阻塞</button>
-      <div id="actionResult" class="action-result neutral">尚未执行操作。</div>
-      <p class="warning">自动模式只执行已批准、已校验的计划；登录、验证码、风控和未知状态必须人工处理。</p>
+      <button id="smartChapterAction" disabled>处理本章</button>
+      <div id="actionResult" class="action-result neutral">选择一章后，插件会告诉你唯一需要做的下一步。</div>
+      <details class="advanced-panel chapter-tools">
+        <summary>高级：单步工具</summary>
+        <button id="reconcileChapter" class="secondary" disabled>核对当前番茄章节</button>
+        <button id="fillChapter" class="secondary" disabled>只填充，不提交</button>
+        <button id="autoPublishChapter" class="secondary" disabled>按已有排程发布</button>
+        <button id="resumeBlocked" class="secondary" disabled>核对平台后解除阻塞</button>
+      </details>
+      <p class="warning">验证码、风控、内容冲突或未知页面仍会停止，不会绕过安全检查。</p>
     </section>
   </main>
 

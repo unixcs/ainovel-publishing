@@ -152,8 +152,8 @@ def build_publication_plan(
                 result.append(PlanItem(
                     candidate.chapter_no, candidate.title, candidate.text_sha256,
                     candidate.quota_units, existing.publication_date,
-                    existing.publication_time or slot, "blocked",
-                    "existing_schedule_version_unverified",
+                    existing.publication_time or slot, "reserved",
+                    "existing_platform_record_unverified",
                 ))
             elif existing.text_sha256 != candidate.text_sha256:
                 result.append(PlanItem(
@@ -184,10 +184,10 @@ def build_publication_plan(
             ))
             continue
 
+        resume_existing_editor = candidate.status in {"fill_started", "filled"}
         if candidate.status in {
             "version_conflict", "blocked", "legacy_published", "legacy_draft",
-            "fill_started", "filled", "awaiting_ai_choice", "submitted",
-            "published", "scheduled", "saved_draft",
+            "awaiting_ai_choice", "submitted", "published", "scheduled", "saved_draft",
         }:
             result.append(PlanItem(
                 candidate.chapter_no, candidate.title, candidate.text_sha256,
@@ -217,6 +217,7 @@ def build_publication_plan(
         result.append(PlanItem(
             candidate.chapter_no, candidate.title, candidate.text_sha256,
             candidate.quota_units, publication_date, slot, "planned",
+            "resume_current_editor" if resume_existing_editor else None,
         ))
         cursor += timedelta(days=1)
 

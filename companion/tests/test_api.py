@@ -110,6 +110,23 @@ def test_platform_schedule_observation_does_not_claim_body_version(tmp_path: Pat
     assert schedule["text_sha256"] is None
     assert schedule["version_verified"] is False
 
+    # Existence/date evidence is enough to skip duplicate creation and reserve the
+    # full daily quota. Body verification remains a visible recommendation, not a
+    # global stop that prevents later chapters from being planned.
+    plan_response = client.post(
+        f"/api/v1/books/{row['book_id']}/publication-plans",
+        headers={"X-Ainovel-Token": "secret"},
+        json={"slot": "20:00", "daily_limit": 9999, "ai_policy": "remember", "start_date": "2026-07-23"},
+    )
+    assert plan_response.status_code == 200
+    plan = plan_response.json()
+    assert plan["items"][0]["status"] == "reserved"
+    approved = client.post(
+        f"/api/v1/publication-plans/{plan['plan_id']}/approve",
+        headers={"X-Ainovel-Token": "secret"},
+    )
+    assert approved.status_code == 200
+
 
 def test_verified_schedule_requires_read_back_time(tmp_path: Path):
     cfg = config(tmp_path)

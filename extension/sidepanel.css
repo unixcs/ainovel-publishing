@@ -49,3 +49,16 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 .plan-item { padding:7px 8px; border-radius:7px; background:#f7f3ec; font-size:11px; line-height:1.45; }
 .plan-item.blocked { background:#f8ded9; color:var(--danger); }
 @media (max-width:420px) { .settings-grid { grid-template-columns:1fr; } .toolbar { grid-template-columns:1fr; } }
+
+.primary-actions { margin-bottom:9px; }
+.primary-actions button { flex:1; }
+.platform-summary { padding:9px 10px; border-radius:9px; font-size:12px; line-height:1.65; white-space:pre-wrap; }
+.platform-summary.neutral { background:#eee8df; color:var(--ink); }
+.platform-summary.ok { background:#dff3e9; color:var(--ok); }
+.platform-summary.warn { background:#fff0c9; color:var(--warn); }
+.safe-note { color:var(--ok); font-weight:650; text-align:center; }
+.advanced-panel { margin-top:10px; border-top:1px dashed var(--line); padding-top:8px; }
+.advanced-panel > summary { color:var(--muted); font-size:12px; font-weight:650; }
+.chapter-tools button { width:100%; margin-top:6px; }
+.plan-item.reserved { background:#eef4ff; color:#335f91; }
+.plan-item.done { background:#dff3e9; color:var(--ok); }
