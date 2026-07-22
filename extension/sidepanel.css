@@ -38,3 +38,14 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 .action-result.ok { background:#dff3e9; color:var(--ok); }
 .action-result.warn { background:#fff0c9; color:var(--warn); }
 .action-result.danger { background:#f8ded9; color:var(--danger); }
+.settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.check-label { display:flex; align-items:center; gap:7px; font-weight:650; }
+.check-label input { width:auto; margin:0; }
+.wrap { flex-wrap:wrap; }
+.wrap button { flex:1 1 45%; }
+.plan-panel { border-color:#d5c2a7; }
+.plan-meta { color:var(--muted); font-size:11px; margin-bottom:7px; }
+.plan-list { max-height:240px; overflow:auto; display:flex; flex-direction:column; gap:5px; margin-top:8px; }
+.plan-item { padding:7px 8px; border-radius:7px; background:#f7f3ec; font-size:11px; line-height:1.45; }
+.plan-item.blocked { background:#f8ded9; color:var(--danger); }
+@media (max-width:420px) { .settings-grid { grid-template-columns:1fr; } .toolbar { grid-template-columns:1fr; } }

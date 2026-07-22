@@ -116,5 +116,9 @@ class RemoteSynchronizer:
                 )
             finally:
                 sftp.close()
+        except SyncError:
+            raise
+        except Exception as exc:
+            raise SyncError(f"Remote synchronization failed: {exc}") from exc
         finally:
             ssh.close()

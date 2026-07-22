@@ -10,9 +10,14 @@ from typing import Any, Iterator
 PLATFORM_PERSISTED_STATES = {
     "legacy_published",
     "legacy_draft",
+    "filled",
     "saved_draft",
+    "awaiting_ai_choice",
+    "submitted",
+    "scheduled",
     "published",
     "verified",
+    "blocked",
 }
 EVENT_STATUS = {
     "synced": "synced",
@@ -23,6 +28,33 @@ EVENT_STATUS = {
     "verified": "verified",
     "reconcile_match": "saved_draft",
     "reconcile_conflict": "version_conflict",
+    "planned": "planned",
+    "plan_approved": "planned",
+    "schedule_submitted": "submitted",
+    "schedule_verified": "scheduled",
+    "awaiting_ai_choice": "awaiting_ai_choice",
+    # Observation events prove that a platform row exists, but deliberately do not
+    # claim that its body matches the current source chapter version.
+    "schedule_observed": None,
+    "published_observed": None,
+    "platform_record_observed": None,
+    "blocked": "blocked",
+    "resumed": "planned",
+}
+
+RESUME_ACKNOWLEDGEMENT = "platform_checked_no_submission"
+PLATFORM_STATES_REQUIRING_RECONCILIATION = {
+    "scheduled",
+    "published",
+    "scheduled_unverified",
+    "published_unverified",
+    "submitted",
+    "submitted_unverified",
+}
+PRE_MUTATION_RESUMABLE_REASONS = {
+    "login_required",
+    "work_identity_mismatch",
+    "unknown_page_state",
 }
 
 
@@ -100,6 +132,40 @@ class PublishingDB:
                     FOREIGN KEY (book_id, chapter_no) REFERENCES chapters(book_id, chapter_no)
                 );
 
+                CREATE TABLE IF NOT EXISTS publication_plans (
+                    plan_id TEXT PRIMARY KEY,
+                    book_id TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    daily_limit INTEGER NOT NULL,
+                    default_slot TEXT NOT NULL,
+                    ai_policy TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    approved_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (book_id) REFERENCES books(book_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS publication_plan_items (
+                    plan_id TEXT NOT NULL,
+                    book_id TEXT NOT NULL,
+                    chapter_no INTEGER NOT NULL,
+                    text_sha256 TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    quota_units INTEGER NOT NULL,
+                    publication_date TEXT,
+                    publication_time TEXT,
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (plan_id, chapter_no),
+                    FOREIGN KEY (plan_id) REFERENCES publication_plans(plan_id) ON DELETE CASCADE,
+                    FOREIGN KEY (book_id, chapter_no) REFERENCES chapters(book_id, chapter_no)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_plan_items_book
+                    ON publication_plan_items(book_id, status, chapter_no);
                 CREATE INDEX IF NOT EXISTS idx_chapters_status
                     ON chapters(book_id, status, chapter_no);
                 CREATE INDEX IF NOT EXISTS idx_events_chapter
@@ -279,6 +345,266 @@ class PublishingDB:
             ).fetchone()
             return dict(row) if row else None
 
+    def list_plan_candidates(self, book_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT book_id, chapter_no, title, text_sha256, char_count, body, version, status,
+                       platform_state, updated_at
+                FROM chapters
+                WHERE book_id=? AND status IN (
+                    'ready', 'synced', 'fill_started', 'filled', 'saved_draft',
+                    'awaiting_ai_choice', 'submitted', 'legacy_draft',
+                    'version_conflict', 'blocked'
+                )
+                ORDER BY chapter_no
+                """,
+                (book_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_verified_schedules(self, book_id: str) -> list[dict[str, Any]]:
+        """Return latest platform schedule evidence, including unverified versions.
+
+        ``verified`` means the schedule row/date was read from the platform.
+        ``version_verified`` separately means the platform body was matched to the
+        immutable local chapter hash. Keeping these separate prevents chapter-number
+        matches from being treated as content verification.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT e.chapter_no, e.text_sha256, e.event_type, e.payload_json, e.created_at
+                FROM events e
+                WHERE e.book_id=? AND e.event_type IN (
+                    'schedule_observed', 'published_observed',
+                    'schedule_verified', 'published', 'verified'
+                )
+                ORDER BY e.chapter_no, e.id
+                """,
+                (book_id,),
+            ).fetchall()
+        latest: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            payload = json.loads(row["payload_json"] or "{}")
+            if not payload.get("publication_date"):
+                continue
+            version_verified = bool(
+                payload.get(
+                    "version_verified",
+                    row["event_type"] not in {"schedule_observed", "published_observed"},
+                )
+            )
+            if row["event_type"] in {"schedule_observed", "schedule_verified"}:
+                platform_state = "scheduled"
+            else:
+                platform_state = "published"
+            latest[int(row["chapter_no"])] = {
+                "chapter_no": int(row["chapter_no"]),
+                "text_sha256": row["text_sha256"] if version_verified else None,
+                "publication_date": str(payload["publication_date"]),
+                "publication_time": payload.get("publication_time"),
+                "quota_units": int(payload.get("quota_units") or 0),
+                "verified": True,
+                "version_verified": version_verified,
+                "platform_state": platform_state,
+            }
+        return list(latest.values())
+
+    def create_publication_plan(
+        self,
+        book_id: str,
+        *,
+        timezone: str,
+        daily_limit: int,
+        default_slot: str,
+        ai_policy: str,
+        items: list[dict[str, Any]],
+        plan_id: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as conn:
+            book = conn.execute("SELECT 1 FROM books WHERE book_id=?", (book_id,)).fetchone()
+            if book is None:
+                raise KeyError("book_not_found")
+            conn.execute(
+                """
+                INSERT INTO publication_plans(
+                    plan_id, book_id, timezone, daily_limit, default_slot, ai_policy,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                """,
+                (plan_id, book_id, timezone, daily_limit, default_slot, ai_policy, now, now),
+            )
+            for item in items:
+                conn.execute(
+                    """
+                    INSERT INTO publication_plan_items(
+                        plan_id, book_id, chapter_no, text_sha256, title, quota_units,
+                        publication_date, publication_time, status, reason, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        plan_id, book_id, int(item["chapter_no"]), str(item["text_sha256"]),
+                        str(item.get("title") or ""), int(item.get("quota_units") or 0),
+                        item.get("publication_date"), item.get("publication_time"),
+                        str(item.get("status") or "planned"), item.get("reason"), now, now,
+                    ),
+                )
+        return self.get_publication_plan(plan_id)
+
+    def get_publication_plan(self, plan_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            plan_row = conn.execute(
+                "SELECT * FROM publication_plans WHERE plan_id=?", (plan_id,)
+            ).fetchone()
+            if plan_row is None:
+                return None
+            item_rows = conn.execute(
+                """
+                SELECT * FROM publication_plan_items
+                WHERE plan_id=? ORDER BY chapter_no
+                """,
+                (plan_id,),
+            ).fetchall()
+        result = dict(plan_row)
+        result["items"] = [dict(row) for row in item_rows]
+        return result
+
+    def list_publication_plans(self, book_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT plan_id FROM publication_plans WHERE book_id=? ORDER BY created_at DESC LIMIT ?",
+                (book_id, min(max(limit, 1), 100)),
+            ).fetchall()
+        return [self.get_publication_plan(row["plan_id"]) for row in rows]
+
+    def approve_publication_plan(self, plan_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM publication_plans WHERE plan_id=?", (plan_id,)).fetchone()
+            if row is None:
+                raise KeyError("plan_not_found")
+            blocked = conn.execute(
+                "SELECT 1 FROM publication_plan_items WHERE plan_id=? AND status='blocked' LIMIT 1",
+                (plan_id,),
+            ).fetchone()
+            if blocked:
+                raise ValueError("plan_contains_blocked_items")
+            conn.execute(
+                "UPDATE publication_plans SET status='approved', approved_at=?, updated_at=? WHERE plan_id=?",
+                (now, now, plan_id),
+            )
+        return self.get_publication_plan(plan_id)
+
+    def update_plan_item_status(self, plan_id: str, chapter_no: int, status: str, reason: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publication_plan_items
+                SET status=?, reason=?, updated_at=?
+                WHERE plan_id=? AND chapter_no=?
+                """,
+                (status, reason, utc_now(), plan_id, chapter_no),
+            )
+
+    def resume_plan_item(
+        self,
+        plan_id: str,
+        chapter_no: int,
+        text_sha256: str,
+        *,
+        acknowledgement: str,
+    ) -> dict[str, Any]:
+        """Reopen one runtime-blocked item after an explicit platform check.
+
+        This deliberately cannot clear planning-time conflicts or an ambiguous platform
+        state. Those must be reconciled with Fanqie first so a retry cannot create a
+        duplicate chapter or schedule.
+        """
+        if acknowledgement != RESUME_ACKNOWLEDGEMENT:
+            raise ValueError("resume_acknowledgement_required")
+
+        now = utc_now()
+        with self.connect() as conn:
+            plan = conn.execute(
+                "SELECT * FROM publication_plans WHERE plan_id=?", (plan_id,)
+            ).fetchone()
+            if plan is None:
+                raise KeyError("plan_not_found")
+            if plan["status"] != "approved":
+                raise ValueError("plan_not_approved")
+
+            item = conn.execute(
+                "SELECT * FROM publication_plan_items WHERE plan_id=? AND chapter_no=?",
+                (plan_id, chapter_no),
+            ).fetchone()
+            if item is None:
+                raise KeyError("plan_item_not_found")
+            if item["status"] != "blocked":
+                raise ValueError("plan_item_not_blocked")
+            if item["text_sha256"] != text_sha256:
+                raise ValueError("stale_plan_item_version")
+
+            chapter = conn.execute(
+                "SELECT * FROM chapters WHERE book_id=? AND chapter_no=?",
+                (plan["book_id"], chapter_no),
+            ).fetchone()
+            if chapter is None:
+                raise KeyError("chapter_not_found")
+            if chapter["text_sha256"] != text_sha256:
+                raise ValueError("stale_chapter_version")
+            if chapter["status"] != "blocked":
+                raise ValueError("chapter_not_blocked")
+            if chapter["platform_state"] in PLATFORM_STATES_REQUIRING_RECONCILIATION:
+                raise ValueError("platform_state_requires_reconciliation")
+            if item["reason"] not in PRE_MUTATION_RESUMABLE_REASONS:
+                raise ValueError("blocked_stage_requires_reconciliation")
+
+            payload = {
+                "plan_id": plan_id,
+                "acknowledgement": acknowledgement,
+                "previous_error": chapter["last_error"],
+                "previous_reason": item["reason"],
+            }
+            conn.execute(
+                """
+                INSERT INTO events(book_id, chapter_no, event_type, text_sha256, payload_json, created_at)
+                VALUES (?, ?, 'resumed', ?, ?, ?)
+                """,
+                (
+                    plan["book_id"],
+                    chapter_no,
+                    text_sha256,
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE chapters
+                SET status='planned', last_error=NULL, updated_at=?
+                WHERE book_id=? AND chapter_no=?
+                """,
+                (now, plan["book_id"], chapter_no),
+            )
+            conn.execute(
+                """
+                UPDATE publication_plan_items
+                SET status='planned', reason=NULL, updated_at=?
+                WHERE plan_id=? AND chapter_no=?
+                """,
+                (now, plan_id, chapter_no),
+            )
+            conn.execute(
+                "UPDATE publication_plans SET updated_at=? WHERE plan_id=?",
+                (now, plan_id),
+            )
+        result = self.get_publication_plan(plan_id)
+        if result is None:  # Defensive: the row was present in the transaction above.
+            raise KeyError("plan_not_found")
+        return result
+
     def record_event(
         self,
         book_id: str,
@@ -298,11 +624,17 @@ class PublishingDB:
                 raise KeyError("chapter_not_found")
             if chapter["text_sha256"] != text_sha256:
                 raise ValueError("stale_chapter_version")
-            new_status = EVENT_STATUS.get(event_type, chapter["status"])
+            mapped_status = EVENT_STATUS.get(event_type)
+            new_status = mapped_status or chapter["status"]
             platform_state = payload.get("platform_state", chapter["platform_state"])
             platform_chapter_id = payload.get("platform_chapter_id", chapter["platform_chapter_id"])
-            verified_at = now if event_type in {"saved_draft", "published", "verified", "reconcile_match"} else chapter["verified_at"]
-            last_error = payload.get("error") if event_type == "failed" else None
+            verified_at = now if event_type in {"saved_draft", "published", "verified", "reconcile_match", "schedule_verified"} else chapter["verified_at"]
+            if event_type in {"failed", "blocked"}:
+                last_error = payload.get("error") or event_type
+            elif event_type in {"resumed", "schedule_verified", "published", "verified", "reconcile_match"}:
+                last_error = None
+            else:
+                last_error = chapter["last_error"]
             conn.execute(
                 """
                 INSERT INTO events(book_id, chapter_no, event_type, text_sha256, payload_json, created_at)
@@ -318,6 +650,27 @@ class PublishingDB:
                 """,
                 (new_status, platform_state, platform_chapter_id, verified_at, last_error, now, book_id, chapter_no),
             )
+            plan_id = payload.get("plan_id")
+            if plan_id:
+                plan_status = {
+                    "planned": "planned",
+                    "plan_approved": "planned",
+                    "schedule_submitted": "submitted",
+                    "schedule_verified": "scheduled",
+                    "awaiting_ai_choice": "awaiting_ai_choice",
+                    "published": "published",
+                    "blocked": "blocked",
+                    "resumed": "planned",
+                }.get(event_type)
+                if plan_status:
+                    conn.execute(
+                        """
+                        UPDATE publication_plan_items
+                        SET status=?, reason=?, updated_at=?
+                        WHERE plan_id=? AND chapter_no=?
+                        """,
+                        (plan_status, payload.get("error"), now, plan_id, chapter_no),
+                    )
             updated = conn.execute(
                 "SELECT * FROM chapters WHERE book_id=? AND chapter_no=?",
                 (book_id, chapter_no),

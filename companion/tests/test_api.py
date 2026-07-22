@@ -25,3 +25,205 @@ def test_api_requires_token(tmp_path: Path):
     assert client.get("/api/v1/health").status_code == 200
     assert client.get("/api/v1/books").status_code == 401
     assert client.get("/api/v1/books", headers={"X-Ainovel-Token": "secret"}).status_code == 200
+
+
+def test_publication_plan_api_and_platform_observation(tmp_path: Path):
+    cfg = config(tmp_path)
+    db = PublishingDB(cfg.database_path)
+    row = db.upsert_manifest_entry("示例小说", {
+        "chapter_no": 6,
+        "title": "第6章",
+        "source_file": "06.md",
+        "source_sha256": "a" * 64,
+        "text_sha256": "6" * 64,
+        "char_count": 6,
+        "line_count": 1,
+        "generated_at": "2026-07-22T00:00:00Z",
+        "text_path": "chapters/0006.txt",
+        "zip_path": "ready/0006.zip",
+        "duplicate_of": None,
+    }, "一二三四五六")
+    client = TestClient(create_app(cfg, db))
+    headers = {"X-Ainovel-Token": "secret"}
+    response = client.post(
+        f"/api/v1/books/{row['book_id']}/publication-plans",
+        headers=headers,
+        json={"slot": "20:00", "daily_limit": 9999, "ai_policy": "remember", "start_date": "2026-07-23"},
+    )
+    assert response.status_code == 200
+    plan = response.json()
+    assert plan["items"][0]["publication_date"] == "2026-07-23"
+    approved = client.post(f"/api/v1/publication-plans/{plan['plan_id']}/approve", headers=headers)
+    assert approved.status_code == 200
+    observed = client.post(
+        f"/api/v1/books/{row['book_id']}/platform-observations",
+        headers=headers,
+        json={"observations": [{
+            "chapter_no": 6,
+            "text_sha256": "6" * 64,
+            "publication_date": "2026-07-23",
+            "publication_time": "20:00",
+            "quota_units": 6,
+            "version_verified": True,
+        }]},
+    )
+    assert observed.status_code == 200
+    assert db.get_chapter(row["book_id"], 6)["status"] == "scheduled"
+
+
+def test_platform_schedule_observation_does_not_claim_body_version(tmp_path: Path):
+    cfg = config(tmp_path)
+    db = PublishingDB(cfg.database_path)
+    row = db.upsert_manifest_entry("示例小说", {
+        "chapter_no": 6,
+        "title": "第6章",
+        "source_file": "06.md",
+        "source_sha256": "a" * 64,
+        "text_sha256": "6" * 64,
+        "char_count": 6,
+        "line_count": 1,
+        "generated_at": "2026-07-22T00:00:00Z",
+        "text_path": "chapters/0006.txt",
+        "zip_path": "ready/0006.zip",
+        "duplicate_of": None,
+    }, "一二三四五六")
+    client = TestClient(create_app(cfg, db))
+    response = client.post(
+        f"/api/v1/books/{row['book_id']}/platform-observations",
+        headers={"X-Ainovel-Token": "secret"},
+        json={"observations": [{
+            "chapter_no": 6,
+            "text_sha256": "6" * 64,
+            "publication_date": "2026-07-23",
+            "publication_time": "20:00",
+            "quota_units": 9999,
+            "platform_state": "scheduled",
+            "version_verified": False,
+            "evidence": "第 6 章 定时发布 2026-07-23 20:00",
+        }]},
+    )
+    assert response.status_code == 200
+    chapter = db.get_chapter(row["book_id"], 6)
+    assert chapter["status"] == "ready"
+    assert chapter["platform_state"] == "scheduled_unverified"
+    schedule = db.list_verified_schedules(row["book_id"])[0]
+    assert schedule["text_sha256"] is None
+    assert schedule["version_verified"] is False
+
+
+def test_verified_schedule_requires_read_back_time(tmp_path: Path):
+    cfg = config(tmp_path)
+    db = PublishingDB(cfg.database_path)
+    row = db.upsert_manifest_entry("示例小说", {
+        "chapter_no": 6, "title": "第6章", "source_file": "06.md",
+        "source_sha256": "a" * 64, "text_sha256": "6" * 64,
+        "char_count": 6, "line_count": 1,
+        "generated_at": "2026-07-22T00:00:00Z", "text_path": "chapters/0006.txt",
+        "zip_path": None, "duplicate_of": None,
+    }, "一二三四五六")
+    client = TestClient(create_app(cfg, db))
+    response = client.post(
+        f"/api/v1/books/{row['book_id']}/platform-observations",
+        headers={"X-Ainovel-Token": "secret"},
+        json={"observations": [{
+            "chapter_no": 6, "text_sha256": "6" * 64,
+            "publication_date": "2026-07-23", "publication_time": None,
+            "quota_units": 6, "platform_state": "scheduled", "version_verified": True,
+        }]},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "verified_schedule_requires_publication_time"
+
+
+def test_plan_cannot_exceed_configured_daily_safety_cap(tmp_path: Path):
+    cfg = config(tmp_path)
+    db = PublishingDB(cfg.database_path)
+    row = db.upsert_manifest_entry("示例小说", {
+        "chapter_no": 6, "title": "第6章", "source_file": "06.md",
+        "source_sha256": "a" * 64, "text_sha256": "6" * 64,
+        "char_count": 6, "line_count": 1,
+        "generated_at": "2026-07-22T00:00:00Z", "text_path": "chapters/0006.txt",
+        "zip_path": "ready/0006.zip", "duplicate_of": None,
+    }, "一二三四五六")
+    client = TestClient(create_app(cfg, db))
+    response = client.post(
+        f"/api/v1/books/{row['book_id']}/publication-plans",
+        headers={"X-Ainovel-Token": "secret"},
+        json={"slot": "20:00", "daily_limit": 10000, "ai_policy": "remember"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "daily_limit_exceeds_configured_safety_cap"
+
+
+def test_unreconciled_earlier_draft_blocks_plan_approval(tmp_path: Path):
+    cfg = config(tmp_path)
+    db = PublishingDB(cfg.database_path)
+    common = {
+        "source_sha256": "a" * 64, "char_count": 6, "line_count": 1,
+        "generated_at": "2026-07-22T00:00:00Z", "duplicate_of": None,
+    }
+    fourth = db.upsert_manifest_entry("示例小说", {
+        **common, "chapter_no": 4, "title": "第4章", "source_file": "04.md",
+        "text_sha256": "4" * 64, "text_path": "chapters/0004.txt", "zip_path": None,
+    }, "第四章正文")
+    db.upsert_manifest_entry("示例小说", {
+        **common, "chapter_no": 5, "title": "第5章", "source_file": "05.md",
+        "text_sha256": "5" * 64, "text_path": "chapters/0005.txt", "zip_path": None,
+    }, "第五章正文")
+    client = TestClient(create_app(cfg, db))
+    headers = {"X-Ainovel-Token": "secret"}
+    response = client.post(
+        f"/api/v1/books/{fourth['book_id']}/publication-plans",
+        headers=headers,
+        json={"slot": "20:00", "daily_limit": 9999, "ai_policy": "remember", "start_date": "2026-07-23"},
+    )
+    assert response.status_code == 200
+    plan = response.json()
+    assert plan["items"][0]["chapter_no"] == 4
+    assert plan["items"][0]["status"] == "blocked"
+    assert plan["items"][0]["reason"] == "chapter_status:legacy_draft"
+    approval = client.post(f"/api/v1/publication-plans/{plan['plan_id']}/approve", headers=headers)
+    assert approval.status_code == 409
+    assert approval.json()["detail"] == "plan_contains_blocked_items"
+
+
+def test_blocked_plan_item_resume_api(tmp_path: Path):
+    cfg = config(tmp_path)
+    db = PublishingDB(cfg.database_path)
+    row = db.upsert_manifest_entry("示例小说", {
+        "chapter_no": 6,
+        "title": "第6章",
+        "source_file": "06.md",
+        "source_sha256": "a" * 64,
+        "text_sha256": "6" * 64,
+        "char_count": 6,
+        "line_count": 1,
+        "generated_at": "2026-07-22T00:00:00Z",
+        "text_path": "chapters/0006.txt",
+        "zip_path": "ready/0006.zip",
+        "duplicate_of": None,
+    }, "一二三四五六")
+    db.create_publication_plan(
+        row["book_id"], timezone="Asia/Shanghai", daily_limit=9999,
+        default_slot="20:00", ai_policy="remember", plan_id="resume-api",
+        items=[{
+            "chapter_no": 6, "text_sha256": "6" * 64, "title": "第6章",
+            "quota_units": 6, "publication_date": "2026-07-23",
+            "publication_time": "20:00", "status": "planned",
+        }],
+    )
+    db.approve_publication_plan("resume-api")
+    db.record_event(row["book_id"], 6, "blocked", "6" * 64, {
+        "plan_id": "resume-api", "error": "login_required",
+    })
+    client = TestClient(create_app(cfg, db))
+    response = client.post(
+        "/api/v1/publication-plans/resume-api/items/6/resume",
+        headers={"X-Ainovel-Token": "secret"},
+        json={
+            "text_sha256": "6" * 64,
+            "acknowledgement": "platform_checked_no_submission",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["items"][0]["status"] == "planned"

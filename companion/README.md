@@ -5,7 +5,9 @@ Windows-first local companion for the Ainovel publishing workflow. It:
 - connects to the Ainovel server over SSH/SFTP;
 - incrementally downloads release manifests and chapter text;
 - stores the publishing ledger in SQLite;
-- exposes an authenticated API on `127.0.0.1:8787` for the browser extension.
+- exposes an authenticated API on `127.0.0.1:8787` for the browser extension;
+- plans publication-day quota with a configurable safety cap and durable schedule evidence;
+- distinguishes a visible platform schedule from a body-version-verified schedule.
 
 ## Development
 

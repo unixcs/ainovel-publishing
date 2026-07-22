@@ -1,64 +1,115 @@
-# Phase One Implementation Plan
+# Automated Publication Implementation Plan
 
-Updated: 2026-07-22
+Updated: 2026-07-22. Core implementation and fixture tests are complete; Windows deployment and real Fanqie DOM validation remain staged with automatic execution disabled.
 
-## Goal
-
-Provide a Windows 11 Pro 22H2 publishing workstation that reliably processes both the existing chapter 5 onward backlog and future completed chapters, one chapter at a time, while keeping final save and publication under human control.
-
-## Architecture
+## Target architecture
 
 ```text
-ainovel source chapters
-  -> server exporter and manifest
-  -> Windows companion over SSH/SFTP
-  -> local SQLite publishing ledger and chapter cache
-  -> authenticated localhost API on 127.0.0.1:8787
-  -> Chrome extension queue and preview
-  -> one-chapter Fanqie editor fill
-  -> human review and save/publish
-  -> extension verifies platform result
-  -> companion records verified event in the server-backed workflow
+Ainovel source + progress
+  -> server exporter + manifest
+  -> SSH/SFTP
+  -> Windows companion + SQLite ledger
+  -> quota planner + publication plan
+  -> authenticated localhost API
+  -> Edge extension automation state machine
+  -> Fanqie editor and publication settings
+  -> scheduled/public platform state
+  -> read-back verification + ledger event
 ```
 
-## Components
+### Ownership
 
-### Server exporter
+**Server exporter** owns deterministic chapter normalization, hashes, and release artifacts. It does not hold Fanqie credentials or operate a browser.
 
-- Existing source of normalized TXT artifacts and SHA256 manifest entries.
-- Full batch ZIP remains for bootstrap, backup, and recovery.
-- Incremental consumers compare chapter hashes and download only changed versions.
+**Windows companion** owns synchronization, the durable ledger, quota configuration, publication plans, reconciliation records, retry-safe checkpoints, and local notifications/API.
 
-### Windows companion
+**Edge extension** owns login/work/page recognition, navigation, editor interaction, dialog handling, publication settings, and platform read-back verification. It never treats a click as proof of success.
 
-- Owns SSH/SFTP connectivity and reconnection.
-- Runs or requests a server export before synchronization.
-- Stores chapters, versions, attempts, events, and last verified state in SQLite.
-- Never treats extension-local storage as authoritative.
-- Binds only to `127.0.0.1` and requires a local API token.
+**User** owns credentials, CAPTCHA/risk-control intervention, policy overrides, and resolving version conflicts. A single “start this approved plan” action enables automated execution; no hidden mutation occurs outside the plan.
 
-### Chrome extension
+## State machine
 
-- Shows the backlog and future ready chapters from the companion.
-- Previews exactly one selected chapter.
-- Fills exactly one Fanqie editor page and then stops.
-- Never saves, publishes, closes unknown dialogs, or advances automatically in phase one.
-- Verifies page identity and filled content before reporting an event.
+The browser runner must implement explicit states rather than a sequence of blind clicks:
 
-## Bootstrap
+```text
+plan_created
+  -> plan_approved
+  -> login_verified
+  -> work_verified
+  -> chapter_target_verified
+  -> editor_ready
+  -> fields_filled
+  -> fields_verified
+  -> next_step_verified
+  -> typo_prompt_confirmed (optional)
+  -> full_check_started
+  -> full_check_completed
+  -> publish_settings_verified
+  -> awaiting_ai_choice (optional manual policy)
+  -> ai_policy_verified
+  -> schedule_submitted
+  -> schedule_verified
+```
 
-- Chapters 1–3 enter the ledger as `legacy_published`.
-- Chapter 4 enters as `legacy_draft` and must be reconciled against the Fanqie draft.
-- Chapters 5 onward enter the normal `ready` queue.
+Every state has a timeout, evidence snapshot, and terminal `blocked` outcome. A chapter-list schedule observation and a chapter-version verification are separate evidence. A browser restart resumes from reconciliation, never from an assumed middle click.
 
-## Fail-closed rules
+## Delivery phases
 
-Unknown page state, authentication prompts, CAPTCHA, declaration/risk dialogs, wrong work/chapter, selector failures, existing chapter conflicts, content mismatch, connection loss, and ambiguous remote state all stop the attempt without retry or advancement.
+### Phase 1 — Domain and persistence
 
-## Delivery sequence
+- Add quota policy, schedule-slot, AI policy, publication-plan, run, and platform-observation models.
+- Extend SQLite events/statuses without losing the existing chapter ledger.
+- Store plan version, source hash, quota date, slot, AI choice, and verification evidence.
+- Add a dry-run planner that produces a human-readable schedule before any browser mutation.
 
-1. Companion database, synchronization, and localhost API.
-2. Extension queue, preview, and health connection.
-3. Fanqie page adapter and one-chapter fill validation.
-4. First-run reconciliation for chapters 1–4.
-5. Windows packaging, startup, logs, backup, and recovery documentation.
+### Phase 2 — Quota planner
+
+- Normalize chapter text using the same count basis as the release artifact.
+- Calculate publication-day usage from verified platform schedules/publications plus the local ledger.
+- Enforce `9999` as the initial effective limit.
+- Offer slots at 12:00, 20:00, and 22:00, defaulting to 20:00.
+- Detect chapters that exceed a day and block them rather than splitting them.
+- Recompute the remaining plan after every verified platform observation.
+
+### Phase 3 — Platform reconciliation
+
+- Read the writer center, current work, chapter list, drafts, and scheduled entries.
+- Match by work identity, chapter number, and available version/content evidence.
+- Adopt matching existing schedules; flag mismatches and duplicates.
+- Never cancel or overwrite an existing schedule automatically.
+
+### Phase 4 — Browser state machine
+
+- Replace broad text/coordinate clicks with scoped, semantic, visible, enabled controls.
+- Verify each transition by its resulting page/dialog state.
+- Handle the known typo confirmation and full-check loading states explicitly.
+- Treat risk prompts, CAPTCHA, login pages, unknown dialogs, and missing selectors as `blocked`.
+- Keep the runner local to the logged-in Edge profile.
+
+### Phase 5 — Scheduling and verification
+
+- Navigate to the writer center and create a chapter only after target reconciliation.
+- Fill and validate chapter number, title, body, normalized count, and source hash.
+- Advance through the known publication flow.
+- Apply the configured AI policy and selected publication slot.
+- Submit once, then verify the chapter appears with the intended schedule/version.
+- Record success only after verification; otherwise preserve the attempt as ambiguous/blocked.
+
+### Phase 6 — Staged rollout
+
+1. **Done:** planner-only mode and fixture-tested state machine.
+2. **Done:** fill-only behavior retained; automation defaults to off.
+3. **Next:** install version 0.2.0 and read the existing fourth/fifth schedule rows.
+4. **Next:** open those scheduled chapters and match chapter number, title, and body before adoption.
+5. **Next:** run one non-critical future chapter with automation still manually triggered.
+6. **Then:** enable automatic execution for later approved plan items.
+7. **Later:** add richer post-mutation recovery, notifications, and audit views after the first verified live runs.
+
+## Tests and acceptance criteria
+
+- Unit tests for quota arithmetic, date/slot assignment, existing-schedule adoption, duplicate prevention, version conflicts, and over-limit chapters.
+- Browser tests with fixture pages for login, editor, typo prompt, full-check loading, AI choice, publish settings, success, unknown dialog, and quota rejection.
+- End-to-end test that kills/restarts the browser after each state and proves reconciliation prevents duplicate submission.
+- A real run is successful only when Fanqie read-back confirms the intended chapter version and future slot.
+
+Current automated suite: 43 unit/browser tests. The restart fault-injection test and real Fanqie acceptance run remain rollout gates, not assumed successes.

@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Ainovel 番茄发布助手",
-  "version": "0.1.1",
-  "description": "从本地 Ainovel Companion 获取章节，一次只向番茄编辑器填充一章。",
+  "version": "0.2.0",
+  "description": "从本地 Ainovel Companion 获取章节，按额度计划在番茄编辑器中填充并验证定时发布。",
   "permissions": [
     "sidePanel",
     "storage",
     "tabs",
     "activeTab",
-    "scripting"
+    "scripting",
+    "alarms"
   ],
   "host_permissions": [
     "http://127.0.0.1:8787/*",

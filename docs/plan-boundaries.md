@@ -1,77 +1,51 @@
-# Publishing Plan Boundaries
+# Automated Publication Plan Boundaries
 
-Updated: 2026-07-22
+Updated: 2026-07-22. This document records the boundaries confirmed during the grill-with-docs session before implementation.
 
 ## Confirmed scope
 
-- One cloud server.
-- One source novel: the configured source novel.
-- One Fanqie work and account.
-- One local computer and one Chrome profile.
-- The server source chapters are the canonical manuscript.
-- Daily transport will be incremental; the full ZIP remains a bootstrap, backup, and recovery path.
-- The browser extension processes exactly one chapter per publishing attempt.
-- After editor fill, automation stops. The user reviews and manually saves the draft or publishes.
+- One cloud source server, one Fanqie work, one Fanqie account, and one Windows 11 workstation with Edge.
+- The canonical manuscript remains on the Ainovel server; the local companion remains the transport and ledger boundary.
+- The extension may automatically complete the known Fanqie publication flow, including final submission and future scheduling.
+- The browser must use the user's existing logged-in Edge profile. Credentials, OTPs, CAPTCHA solving, and risk-control bypasses are out of scope.
+- The first release remains one chapter version per automation run. The planner may produce a multi-day plan, but execution is checkpointed chapter by chapter.
 
-## Existing Fanqie state before tracking begins
+## Quota and schedule policy
 
-- Chapters 1–3: already published.
-- Chapter 4: saved in the Fanqie draft box, not published.
-- Chapter 5 onward: not yet classified by the new publishing workflow.
+- The user's current quota policy is modeled as a **publication-day** limit.
+- Initial effective daily limit: **9,999 quota units**. The UI must show the count used, remaining capacity, and the source of each count.
+- The planner must not split one source chapter into multiple platform chapters automatically. A chapter over the effective limit is blocked for explicit handling.
+- Publication slots are configurable choices, not constants: `12:00`, `20:00`, and `22:00` in `Asia/Shanghai`; the default is `20:00`.
+- A future platform schedule is distinct from the local time when the browser submits it. The planner chooses the publication slot; the runner submits as soon as the browser is available and the plan is still valid.
+- A visible Fanqie schedule reserves capacity immediately, but it is adopted only after the editor title/body confirms the current chapter version.
+- The current fourth- and fifth-chapter schedules are reconciled and adopted if their chapter versions match; they are never submitted again.
 
-## Confirmed first-run reconciliation
+## AI declaration policy
 
-- Chapters 1–3 are imported as `legacy_published` and are never automatically reprocessed.
-- Chapter 4 is imported as `legacy_draft`.
-- The extension compares the Fanqie draft title and body with the current server chapter before accepting it as `saved_draft`.
-- A mismatch stops automation and shows a diff; the extension never overwrites the existing draft without an explicit user decision.
+- The default policy is per-work and remembers the last explicitly confirmed choice.
+- The user can choose “use AI”, “do not use AI”, remember the last explicit per-work choice, or pause at each chapter for a manual choice.
+- If the setting is missing, ambiguous, or changed by the platform, automation stops rather than guessing.
 
-## Confirmed authority and recovery rules
+## Platform state and safety
 
-- The server source chapter is authoritative for manuscript content and version hashes.
-- Fanqie is authoritative for external draft and publication state.
-- A durable server-side publishing ledger records the last platform state that was actually verified.
-- Extension-local storage is a disposable cache and never the authoritative publishing record.
-- Clicking a save or publish control does not prove success. A state transition is recorded only after the extension verifies the result from Fanqie.
-- After a browser crash or ambiguous submission result, the next session reconciles with Fanqie before retrying.
+- Before every mutation, verify login identity, work identity, chapter number, chapter version, editor fields, and the expected page state.
+- After every mutation, read the platform state back before recording success.
+- Existing drafts, schedules, and published chapters are never silently overwritten or duplicated.
+- Unknown dialogs, CAPTCHA, risk-control prompts, login expiry, quota rejection, missing controls, content mismatch, network loss, and ambiguous submission results enter `blocked` and wait for human intervention.
+- A failed or ambiguous click is never counted as a successful publication, and a local file is never archived merely because a button was clicked.
+- Only failures proven to occur before any editor/platform mutation can be reopened directly. Later failures require platform reconciliation before another mutation.
+- The workflow may open the writer center and navigate known pages, but it must not enter credentials or bypass platform controls.
 
-## Confirmed version-change rules
+## Existing platform bootstrap
 
-- A chapter already saved as a Fanqie draft or published is never overwritten automatically.
-- If its server content hash changes, the ledger records `changed_after_publish` or the corresponding draft conflict.
-- The extension presents a content diff and requires an explicit user decision before entering a platform edit flow.
-- New-chapter processing may continue, but unresolved version conflicts remain prominently visible.
+- Chapters already published before ledger tracking are imported as legacy platform states.
+- Existing drafts and schedules are reconciled by chapter number and content/version evidence.
+- A mismatch between an existing platform version and the current source creates a version conflict.
 
-## Confirmed stop policy
+## Explicitly deferred
 
-- Automation fails closed: every unknown page state or failed validation stops the current attempt.
-- Stop conditions include expired login, identity verification, CAPTCHA, risk or declaration dialogs, unexpected work/chapter, missing editor controls, existing chapter-number conflicts, content/hash/count mismatch, lost server connection, ambiguous save/publish result, and unknown dialogs.
-- On stop, the extension records the attempt, explains the reason, and waits for explicit user intervention. It never guesses, bypasses, retries a remote mutation, or advances to the next chapter.
-
-## Confirmed workload boundary
-
-- Phase one serves both the existing chapter 5 onward backlog and all future completed chapters.
-- Backlog processing and ongoing processing use the same durable queue, chapter-version rules, checkpoints, and recovery behavior.
-- Closing Chrome, restarting the computer, or losing the SSH connection must not lose the last verified position or cause a chapter to be repeated.
-
-## Confirmed local architecture boundary
-
-- A lightweight local companion application may be installed on the publishing computer.
-- The companion owns SSH connectivity, incremental synchronization, local caching, reconnection, and the localhost API.
-- The Chrome extension owns the queue UI, chapter preview, Fanqie editor interaction, and platform-result verification.
-- WebDAV, Samba, and a public manuscript API are not required for phase one.
-
-## Confirmed desktop boundary
-
-- The first supported publishing computer is Windows 11 Pro 22H2.
-- Packaging, startup integration, configuration paths, SSH-key handling, and troubleshooting are designed for that platform first.
-- Other desktop operating systems are outside phase one.
-
-## Grilling status
-
-- The ten boundary questions are complete.
-- No additional user decisions are required before phase-one implementation begins.
-
-## Deferred beyond phase one
-
-- Automatic draft saving remains out of phase one unless a later explicit decision changes the boundary.
+- Server-side headless browser execution.
+- Multiple accounts or multiple works in one run.
+- Automatic CAPTCHA/risk-control handling.
+- Automatic chapter splitting or rewriting to fit a quota.
+- Automatic cancellation or replacement of an existing Fanqie schedule.

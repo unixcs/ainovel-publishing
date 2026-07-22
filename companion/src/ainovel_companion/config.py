@@ -50,6 +50,16 @@ class APIConfig:
 
 
 @dataclass(frozen=True)
+class PublicationConfig:
+    timezone: str
+    daily_limit: int
+    default_slot: str
+    slots: tuple[str, ...]
+    default_ai_policy: str
+    automation_enabled: bool
+
+
+@dataclass(frozen=True)
 class AppConfig:
     config_path: Path
     data_dir: Path
@@ -57,6 +67,7 @@ class AppConfig:
     ssh: SSHConfig
     remote: RemoteConfig
     api: APIConfig
+    publication: PublicationConfig | None = None
 
 
 def build_default_config() -> dict:
@@ -82,6 +93,14 @@ def build_default_config() -> dict:
             "port": 8787,
             "token": secrets.token_urlsafe(32),
         },
+        "publication": {
+            "timezone": "Asia/Shanghai",
+            "daily_limit": 9999,
+            "default_slot": "20:00",
+            "slots": ["12:00", "20:00", "22:00"],
+            "default_ai_policy": "remember",
+            "automation_enabled": False,
+        },
     }
 
 
@@ -104,6 +123,16 @@ def load_config(path: Path | None = None) -> AppConfig:
     ssh_raw = raw["ssh"]
     remote_raw = raw["remote"]
     api_raw = raw["api"]
+    publication_raw = raw.get("publication") or {}
+    slots = tuple(str(item) for item in publication_raw.get("slots", ["12:00", "20:00", "22:00"]))
+    publication = PublicationConfig(
+        timezone=str(publication_raw.get("timezone", "Asia/Shanghai")),
+        daily_limit=int(publication_raw.get("daily_limit", 9999)),
+        default_slot=str(publication_raw.get("default_slot", "20:00")),
+        slots=slots,
+        default_ai_policy=str(publication_raw.get("default_ai_policy", "remember")),
+        automation_enabled=bool(publication_raw.get("automation_enabled", False)),
+    )
     key_path = ssh_raw.get("key_path")
     known_hosts_path = ssh_raw.get("known_hosts_path")
     return AppConfig(
@@ -128,4 +157,5 @@ def load_config(path: Path | None = None) -> AppConfig:
             port=int(api_raw.get("port", 8787)),
             token=str(api_raw["token"]),
         ),
+        publication=publication,
     )

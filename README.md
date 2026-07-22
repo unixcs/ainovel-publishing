@@ -1,37 +1,41 @@
 # Ainovel Publishing
 
-A human-controlled publishing pipeline that moves completed Ainovel chapters from a server into the Fanqie Writer editor without automatically saving or publishing them.
+A local-first publishing pipeline that moves completed Ainovel chapters from a server into the Fanqie Writer editor and can create quota-aware future publications without moving the logged-in browser session to the cloud.
 
 ## First-principles design
 
 The system separates four responsibilities because they have different trust and failure boundaries:
 
 1. **Server exporter** — turns canonical completed Markdown chapters into deterministic release artifacts and a SHA256 manifest.
-2. **Windows companion** — owns SSH/SFTP access, local chapter cache, SQLite publishing ledger, and the authenticated localhost API.
-3. **Browser extension** — previews a single queued chapter and fills the current Fanqie editor only after conflict checks.
-4. **Human operator** — reviews the result and remains the only actor allowed to save a draft or publish.
-
-This avoids exposing manuscript files through a public WebDAV/API endpoint, avoids giving a browser extension SSH credentials, and fails closed when the page state is unknown.
+2. **Windows companion** — owns SSH/SFTP access, local chapter cache, SQLite publishing ledger, quota-aware publication plans, and the authenticated localhost API.
+3. **Browser extension** — owns the local logged-in Edge session, page/state recognition, editor interaction, publication settings, and read-back verification.
+4. **Human operator** — approves a publication plan, handles login/CAPTCHA/risk-control or unknown states, and resolves version conflicts. Known planned steps may then run automatically.
 
 ```text
 Ainovel source chapters
   -> server/export_fanqie.py
   -> manifest + chapter artifacts
   -> SSH/SFTP
-  -> Windows companion + SQLite ledger
+  -> Windows companion + SQLite ledger + quota planner
   -> authenticated 127.0.0.1 API
-  -> Edge/Chrome extension
-  -> one-chapter editor fill
-  -> human review and save/publish
+  -> Edge extension state machine
+  -> Fanqie editor and publication settings
+  -> scheduled/public platform state
+  -> read-back verification
 ```
+
+## Current status
+
+Version `0.2.0` implements the quota planner, durable publication plans, platform reconciliation, explicit browser state machine, manual-AI pause, scheduled submission, read-back verification, and fail-closed blocking. Automatic execution defaults to **off** until the live Fanqie selectors are validated on the installed Edge profile. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for the staged rollout and [`docs/plan-boundaries.md`](docs/plan-boundaries.md) for the confirmed grill-with-docs boundaries.
 
 ## Repository layout
 
 - `server/` — exporter deployed beside the Ainovel server workspace.
-- `companion/` — Python Windows companion and tests.
-- `extension/` — Manifest V3 Edge/Chrome extension and tests.
+- `companion/` — Python Windows companion, ledger, planner boundary, and tests.
+- `extension/` — Manifest V3 Edge/Chrome extension and page adapter.
 - `scripts/` — optional manual release-download helper.
 - `docs/adr/` — accepted architecture decisions.
+- `docs/research/` — external project and reuse reviews.
 - `.github/workflows/` — Windows test and executable build workflow.
 
 Runtime data, manuscripts, downloaded releases, API tokens, databases, virtual environments, and compiled executables are intentionally excluded from Git.
@@ -53,15 +57,17 @@ See [`companion/README.md`](companion/README.md). Initialize it, edit the genera
 
 ### 3. Load the extension
 
-See [`extension/README.md`](extension/README.md). Load `extension/` as an unpacked extension in Edge or Chrome, enter the localhost API token, open a Fanqie chapter editor, and fill one chapter at a time.
+See [`extension/README.md`](extension/README.md). Load `extension/` as an unpacked extension in Edge or Chrome, enter the localhost API token, reconcile existing platform schedules, generate and approve a plan, and keep automatic execution off until one manually triggered live run passes.
 
 ## Safety boundaries
 
-- One server, one workstation, one account, and one selected chapter at a time.
-- Existing title/body content is never silently overwritten.
-- Source-version conflicts stop the workflow for manual review.
-- Unknown page states stop the workflow.
-- The extension never automatically saves, publishes, dismisses dialogs, or advances to another chapter.
+- One server, one workstation, one account, one work, and one chapter version per automation run.
+- Existing title/body content, drafts, schedules, and published chapters are never silently overwritten or duplicated.
+- Publication plans cannot exceed the configured safety cap (currently 9,999 units) and offer selectable 12:00/20:00/22:00 Asia/Shanghai slots.
+- A chapter-list schedule reserves quota but is not treated as the current source version until title/body reconciliation succeeds.
+- Source-version conflicts, quota ambiguity, unknown page states, login expiry, CAPTCHA, and risk-control prompts stop the run.
+- A click is never recorded as success until Fanqie read-back verifies the intended chapter and schedule/publication state.
+- Credentials and browser login state remain local; the server never operates the Fanqie browser session.
 - The full ZIP is only a bootstrap, backup, and recovery channel; normal synchronization is incremental.
 
 ## Development checks

@@ -10,15 +10,28 @@
   <header>
     <div>
       <h1>Ainovel 发布助手</h1>
-      <p>一次只处理一章，填充后人工检查。</p>
+      <p>先对账和排程，再按计划逐章自动定时发布。</p>
     </div>
     <span id="connectionBadge" class="badge neutral">未连接</span>
   </header>
 
-  <details class="panel" id="settingsPanel">
-    <summary>本地助手设置</summary>
+  <details class="panel" id="settingsPanel" open>
+    <summary>本地助手与发布策略</summary>
     <label>接口地址<input id="baseUrl" value="http://127.0.0.1:8787"></label>
     <label>API Token<input id="apiToken" type="password" autocomplete="off"></label>
+    <div class="settings-grid">
+      <label>每日安全上限（字）<input id="dailyLimit" type="number" min="1" max="9999" value="9999"></label>
+      <label>默认发布时间<select id="publicationSlot"><option value="12:00">每天 12:00</option><option value="20:00" selected>每天 20:00</option><option value="22:00">每天 22:00</option></select></label>
+    </div>
+    <label>AI 声明策略
+      <select id="aiPolicy">
+        <option value="remember" selected>按作品记住上次明确选择（推荐）</option>
+        <option value="use">使用 AI</option>
+        <option value="no">不使用 AI</option>
+        <option value="ask">每章手动选择</option>
+      </select>
+    </label>
+    <label class="check-label"><input id="automationEnabled" type="checkbox"> 启用已批准计划的自动执行（Edge 必须保持运行）</label>
     <div class="row">
       <button id="saveSettings">保存并测试</button>
       <button id="syncNow" class="secondary">同步服务器</button>
@@ -35,14 +48,33 @@
     <label>状态
       <select id="statusFilter">
         <option value="ready">待处理</option>
+        <option value="filled">已填充待处理</option>
         <option value="version_conflict">版本冲突</option>
         <option value="legacy_draft">旧草稿</option>
         <option value="legacy_published">旧已发布</option>
-        <option value="filled">已填充</option>
+        <option value="scheduled">已定时</option>
+        <option value="blocked">已阻塞</option>
+        <option value="awaiting_ai_choice">等待手动选择 AI</option>
         <option value="">全部</option>
       </select>
     </label>
     <button id="refreshList" class="secondary">刷新队列</button>
+  </section>
+
+  <section class="panel plan-panel">
+    <div class="section-title"><h2>额度排程</h2><span id="planBadge" class="badge neutral">未生成</span></div>
+    <div class="settings-grid">
+      <label>计划起始日期<input id="planStartDate" type="date"></label>
+      <label>计划说明<input id="planSummary" readonly value="先读取平台已有定时任务"></label>
+    </div>
+    <div class="row wrap">
+      <button id="inspectPlatform" class="secondary">读取平台定时任务</button>
+      <button id="createPlan">生成发布计划</button>
+      <button id="approvePlan" class="secondary" disabled>批准当前计划</button>
+      <button id="runNext" disabled>执行计划下一章</button>
+    </div>
+    <div id="planList" class="plan-list">尚未生成发布计划。</div>
+    <p class="warning">计划按实际发布日期计算 9999 字上限；未知页面、额度拒绝或版本冲突会停止，不会重复提交。</p>
   </section>
 
   <main>
@@ -57,8 +89,10 @@
       <pre id="previewBody"></pre>
       <button id="reconcileChapter" class="secondary" disabled>对账当前番茄草稿</button>
       <button id="fillChapter" disabled>填充到当前番茄编辑页</button>
-      <div id="actionResult" class="action-result neutral">尚未执行填充。</div>
-      <p class="warning">插件不会自动保存、发布或跳到下一章。</p>
+      <button id="autoPublishChapter" disabled>按当前计划自动定时发布</button>
+      <button id="resumeBlocked" class="secondary" disabled>核对平台后解除阻塞</button>
+      <div id="actionResult" class="action-result neutral">尚未执行操作。</div>
+      <p class="warning">自动模式只执行已批准、已校验的计划；登录、验证码、风控和未知状态必须人工处理。</p>
     </section>
   </main>
 
