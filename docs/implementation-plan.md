@@ -112,9 +112,13 @@ Every state has a timeout, evidence snapshot, and terminal `blocked` outcome. A 
 - End-to-end test that kills/restarts the browser after each state and proves reconciliation prevents duplicate submission.
 - A real run is successful only when Fanqie read-back confirms the intended chapter version and future slot.
 
-Current automated suite: 43 unit/browser tests. The restart fault-injection test and real Fanqie acceptance run remain rollout gates, not assumed successes.
+Current automated suite: 56 unit/browser tests. The restart fault-injection test and real Fanqie acceptance run remain rollout gates, not assumed successes.
 
 
 ## 2026-07-22 live-trial simplification
 
 Version 0.3.0 implements ADR 0011. The default UI now exposes only refresh and process actions. Existing platform rows reserve quota without becoming global failures, filled editors resume only after an exact local-version check, and the adapter waits for asynchronous editor mounting and controlled-state settlement. Real chapter-list evidence (`审核中`, `待发布`, `已发布`) is isolated per row.
+
+## 2026-07-22 chapter-8 recovery correction
+
+Version 0.3.1 implements ADR 0012. “Next” is now an explicitly recoverable pre-submit checkpoint rather than an assumed external submission. A live chapter-list absence check plus user acknowledgement can reset such a stopped attempt, while `final_submit_armed` and later checkpoints remain reconciliation-only. Publication preparation and final submission are separate page actions, the typo/full-check transition is recognized directly, and only one draft/approved plan remains active per work.

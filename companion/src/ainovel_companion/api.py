@@ -63,6 +63,13 @@ class ResumePlanItemRequest(BaseModel):
     acknowledgement: Literal["platform_checked_no_submission"]
 
 
+class RecoverUnsubmittedRequest(BaseModel):
+    text_sha256: str = Field(min_length=64, max_length=64)
+    acknowledgement: Literal["platform_checked_chapter_absent"]
+    platform_found: Literal[False]
+    evidence_url: str | None = Field(default=None, max_length=2000)
+
+
 def create_app(config: AppConfig, db: PublishingDB, synchronizer: RemoteSynchronizer | None = None) -> FastAPI:
     app = FastAPI(title="Ainovel Publisher Companion", version=__version__)
     app.add_middleware(
@@ -118,7 +125,31 @@ def create_app(config: AppConfig, db: PublishingDB, synchronizer: RemoteSynchron
         if row is None:
             raise HTTPException(status_code=404, detail="chapter_not_found")
         row["events"] = db.list_events(book_id, chapter_no)
+        row["recovery"] = db.get_chapter_recovery(book_id, chapter_no)
         return row
+
+    @app.post(
+        "/api/v1/books/{book_id}/chapters/{chapter_no}/recover-unsubmitted",
+        dependencies=[Depends(require_token)],
+    )
+    def recover_unsubmitted_chapter(
+        book_id: str,
+        chapter_no: int,
+        request: RecoverUnsubmittedRequest,
+    ) -> dict[str, Any]:
+        try:
+            return db.recover_unsubmitted_chapter(
+                book_id,
+                chapter_no,
+                request.text_sha256,
+                acknowledgement=request.acknowledgement,
+                platform_found=request.platform_found,
+                evidence_url=request.evidence_url,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0]))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     @app.post("/api/v1/books/{book_id}/chapters/{chapter_no}/events", dependencies=[Depends(require_token)])
     def record_event(book_id: str, chapter_no: int, request: EventRequest) -> dict[str, Any]:

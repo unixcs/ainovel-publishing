@@ -30,6 +30,7 @@ EVENT_STATUS = {
     "reconcile_conflict": "version_conflict",
     "planned": "planned",
     "plan_approved": "planned",
+    "final_submit_armed": "submitted",
     "schedule_submitted": "submitted",
     "schedule_verified": "scheduled",
     "awaiting_ai_choice": "awaiting_ai_choice",
@@ -43,6 +44,7 @@ EVENT_STATUS = {
 }
 
 RESUME_ACKNOWLEDGEMENT = "platform_checked_no_submission"
+RECOVER_UNSUBMITTED_ACKNOWLEDGEMENT = "platform_checked_chapter_absent"
 PLATFORM_STATES_REQUIRING_RECONCILIATION = {
     "scheduled",
     "published",
@@ -55,6 +57,20 @@ PRE_MUTATION_RESUMABLE_REASONS = {
     "login_required",
     "work_identity_mismatch",
     "unknown_page_state",
+}
+FINAL_SUBMISSION_CHECKPOINTS = {
+    "final_submit_armed",
+    "final_submit_clicked",
+    "schedule_submitted",
+    "schedule_verified",
+    "published",
+    "verified",
+}
+RECOVERABLE_CHECKPOINTS = {
+    "automation_started",
+    "filled",
+    "next_clicked",
+    "awaiting_ai_choice",
 }
 
 
@@ -345,6 +361,168 @@ class PublishingDB:
             ).fetchone()
             return dict(row) if row else None
 
+    @staticmethod
+    def _recovery_state_from_rows(
+        chapter: sqlite3.Row | dict[str, Any],
+        events: list[sqlite3.Row] | list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Describe whether one stopped attempt can return to the new-chapter path.
+
+        Clicking ``Next`` is not Fanqie's final publication mutation. A stopped run is
+        recoverable after a chapter-list absence check until the final-submit action is
+        armed. Once final submission may have been sent, only platform reconciliation
+        can decide the outcome.
+        """
+        result: dict[str, Any] = {
+            "allowed": False,
+            "mode": None,
+            "reason": "chapter_not_blocked",
+            "last_checkpoint": None,
+            "plan_id": None,
+        }
+        if chapter["status"] != "blocked":
+            return result
+        if chapter["platform_state"] in PLATFORM_STATES_REQUIRING_RECONCILIATION:
+            result["reason"] = "platform_state_requires_reconciliation"
+            return result
+
+        current_events = [row for row in events if row["text_sha256"] == chapter["text_sha256"]]
+        attempt_start = 0
+        for index, row in enumerate(current_events):
+            if row["event_type"] == "automation_started":
+                attempt_start = index
+        attempt_events = current_events[attempt_start:]
+
+        for row in reversed(attempt_events):
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if not result["plan_id"] and payload.get("plan_id"):
+                result["plan_id"] = str(payload["plan_id"])
+
+        final_event = next(
+            (row for row in reversed(attempt_events) if row["event_type"] in FINAL_SUBMISSION_CHECKPOINTS),
+            None,
+        )
+        if final_event:
+            result.update(
+                reason="final_submission_requires_reconciliation",
+                last_checkpoint=final_event["event_type"],
+            )
+            return result
+
+        checkpoint = next(
+            (row["event_type"] for row in reversed(attempt_events) if row["event_type"] in RECOVERABLE_CHECKPOINTS),
+            "preflight",
+        )
+        result.update(
+            allowed=True,
+            mode="recover_unsubmitted",
+            reason="platform_absence_check_required",
+            last_checkpoint=checkpoint,
+        )
+        return result
+
+    def get_chapter_recovery(self, book_id: str, chapter_no: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            chapter = conn.execute(
+                "SELECT * FROM chapters WHERE book_id=? AND chapter_no=?",
+                (book_id, chapter_no),
+            ).fetchone()
+            if chapter is None:
+                raise KeyError("chapter_not_found")
+            events = conn.execute(
+                "SELECT * FROM events WHERE book_id=? AND chapter_no=? ORDER BY id",
+                (book_id, chapter_no),
+            ).fetchall()
+            return self._recovery_state_from_rows(chapter, list(events))
+
+    def recover_unsubmitted_chapter(
+        self,
+        book_id: str,
+        chapter_no: int,
+        text_sha256: str,
+        *,
+        acknowledgement: str,
+        platform_found: bool,
+        evidence_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Recover a stopped pre-final-submit attempt after a live absence check."""
+        if acknowledgement != RECOVER_UNSUBMITTED_ACKNOWLEDGEMENT:
+            raise ValueError("recovery_acknowledgement_required")
+        if platform_found is not False:
+            raise ValueError("platform_record_requires_reconciliation")
+
+        now = utc_now()
+        with self.connect() as conn:
+            chapter = conn.execute(
+                "SELECT * FROM chapters WHERE book_id=? AND chapter_no=?",
+                (book_id, chapter_no),
+            ).fetchone()
+            if chapter is None:
+                raise KeyError("chapter_not_found")
+            if chapter["text_sha256"] != text_sha256:
+                raise ValueError("stale_chapter_version")
+            events = conn.execute(
+                "SELECT * FROM events WHERE book_id=? AND chapter_no=? ORDER BY id",
+                (book_id, chapter_no),
+            ).fetchall()
+            recovery = self._recovery_state_from_rows(chapter, list(events))
+            if not recovery["allowed"]:
+                raise ValueError(str(recovery["reason"]))
+
+            active_plans = conn.execute(
+                """
+                SELECT plan_id FROM publication_plans
+                WHERE book_id=? AND status IN ('draft', 'approved')
+                ORDER BY created_at
+                """,
+                (book_id,),
+            ).fetchall()
+            superseded_plan_ids = [str(row["plan_id"]) for row in active_plans]
+            payload = {
+                "acknowledgement": acknowledgement,
+                "platform_found": False,
+                "evidence_url": evidence_url,
+                "last_checkpoint": recovery["last_checkpoint"],
+                "plan_id": recovery["plan_id"],
+            }
+            for event_type in ("platform_absence_observed", "recovered_unsubmitted"):
+                conn.execute(
+                    """
+                    INSERT INTO events(book_id, chapter_no, event_type, text_sha256, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (book_id, chapter_no, event_type, text_sha256, json.dumps(payload, ensure_ascii=False), now),
+                )
+            conn.execute(
+                """
+                UPDATE chapters
+                SET status='ready', platform_state=NULL, platform_chapter_id=NULL,
+                    verified_at=NULL, last_error=NULL, updated_at=?
+                WHERE book_id=? AND chapter_no=?
+                """,
+                (now, book_id, chapter_no),
+            )
+            conn.execute(
+                """
+                UPDATE publication_plans
+                SET status='superseded', updated_at=?
+                WHERE book_id=? AND status IN ('draft', 'approved')
+                """,
+                (now, book_id),
+            )
+
+        chapter_result = self.get_chapter(book_id, chapter_no)
+        if chapter_result is None:  # Defensive: the transaction verified this row.
+            raise KeyError("chapter_not_found")
+        return {
+            "chapter": chapter_result,
+            "recovery": self.get_chapter_recovery(book_id, chapter_no),
+            "superseded_plan_ids": superseded_plan_ids,
+        }
+
     def list_plan_candidates(self, book_id: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -427,6 +605,15 @@ class PublishingDB:
             book = conn.execute("SELECT 1 FROM books WHERE book_id=?", (book_id,)).fetchone()
             if book is None:
                 raise KeyError("book_not_found")
+            # A proposal is a replaceable snapshot. Keeping dozens of active drafts made
+            # the side panel expose stale blockers, so only the newest draft stays active.
+            conn.execute(
+                """
+                UPDATE publication_plans SET status='superseded', updated_at=?
+                WHERE book_id=? AND status='draft'
+                """,
+                (now, book_id),
+            )
             conn.execute(
                 """
                 INSERT INTO publication_plans(
@@ -485,12 +672,26 @@ class PublishingDB:
             row = conn.execute("SELECT * FROM publication_plans WHERE plan_id=?", (plan_id,)).fetchone()
             if row is None:
                 raise KeyError("plan_not_found")
+            if row["status"] == "approved":
+                return self.get_publication_plan(plan_id)
+            if row["status"] != "draft":
+                raise ValueError("plan_not_approvable")
             blocked = conn.execute(
                 "SELECT 1 FROM publication_plan_items WHERE plan_id=? AND status='blocked' LIMIT 1",
                 (plan_id,),
             ).fetchone()
             if blocked:
                 raise ValueError("plan_contains_blocked_items")
+            # Exactly one approved plan may drive a work. Chapter state and platform
+            # observations are canonical, so a newly approved snapshot safely replaces
+            # older pre-submission work instead of creating parallel runners.
+            conn.execute(
+                """
+                UPDATE publication_plans SET status='superseded', updated_at=?
+                WHERE book_id=? AND status='approved' AND plan_id<>?
+                """,
+                (now, row["book_id"], plan_id),
+            )
             conn.execute(
                 "UPDATE publication_plans SET status='approved', approved_at=?, updated_at=? WHERE plan_id=?",
                 (now, now, plan_id),
@@ -655,6 +856,7 @@ class PublishingDB:
                 plan_status = {
                     "planned": "planned",
                     "plan_approved": "planned",
+                    "final_submit_armed": "submitted",
                     "schedule_submitted": "submitted",
                     "schedule_verified": "scheduled",
                     "awaiting_ai_choice": "awaiting_ai_choice",

@@ -38,6 +38,10 @@ _Avoid_: Upload, publish
 A durable proposal mapping chapter versions to publication dates, times, quota units, and the policy choices that will be used for submission.
 _Avoid_: Batch size, upload list
 
+**Active Publication Plan**:
+The single approved publication plan currently allowed to drive browser automation for one work. A newer approval supersedes every older active plan for that work.
+_Avoid_: Latest-looking plan, parallel plan
+
 **Publication Slot**:
 A configured local-time date and time at which Fanqie is intended to make a chapter public, such as 12:00, 20:00, or 22:00 in `Asia/Shanghai`.
 _Avoid_: Run time, browser alarm
@@ -88,13 +92,29 @@ _Avoid_: Automation failure, guessed AI choice
 One controlled attempt to reconcile, fill, submit, and verify one planned chapter version in a local logged-in browser.
 _Avoid_: Macro, click script
 
+**Final Submission Boundary**:
+The point at which the workflow authorizes Fanqie's final publish or scheduled-publish action. Editor fill, “Next”, typo confirmation, and full inspection all occur before this boundary.
+_Avoid_: Next click, editor save
+
+**Recoverable Publication Interruption**:
+A stopped automation run that has not crossed the final submission boundary. It may restart only after a current platform absence observation confirms that the chapter has no draft, schedule, or publication.
+_Avoid_: Failed publication, blind retry
+
+**Ambiguous Final Submission**:
+A run in which the final submission action may have reached Fanqie but its result was not verified. It cannot return to the new-chapter path until platform reconciliation determines the outcome.
+_Avoid_: Retryable error, assumed failure
+
 **Blocked State**:
-A durable state entered when identity, page structure, quota, dialog meaning, or platform result cannot be verified. A blocked chapter requires explicit intervention or a reviewed plan change before another mutation.
+A durable stop when the workflow cannot safely choose its next mutation. It may represent either a recoverable publication interruption or an ambiguous final submission; the last verified checkpoint determines which recovery is legal.
 _Avoid_: Failed click, retryable error
 
 **Reconciliation-Gated Resume**:
-Explicitly reopening a blocked run only after checking that Fanqie has no conflicting draft, schedule, or publication. A post-mutation ambiguous run is reconciled rather than reset to the new-chapter path.
+Explicitly reopening a recoverable publication interruption only after checking that Fanqie has no conflicting draft, schedule, or publication. An ambiguous final submission is reconciled rather than reset to the new-chapter path.
 _Avoid_: Retry button, blind restart
+
+**Platform Absence Observation**:
+Current evidence from the target work's chapter-management list that one chapter number has no draft, scheduled, reviewing, or published row. It authorizes recovery only for a run that never crossed the final submission boundary.
+_Avoid_: Empty cache, missing local row
 
 **Reconciliation**:
 The comparison of the source manifest, local ledger, and Fanqie chapter/draft/schedule state before creating or changing a platform submission.

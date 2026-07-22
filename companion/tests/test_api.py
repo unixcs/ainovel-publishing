@@ -244,3 +244,47 @@ def test_blocked_plan_item_resume_api(tmp_path: Path):
     )
     assert response.status_code == 200
     assert response.json()["items"][0]["status"] == "planned"
+
+
+def test_recover_unsubmitted_chapter_api_uses_checkpoint_and_absence_evidence(tmp_path: Path):
+    cfg = config(tmp_path)
+    db = PublishingDB(cfg.database_path)
+    row = db.upsert_manifest_entry("示例小说", {
+        "chapter_no": 8, "title": "第8章", "source_file": "08.md",
+        "source_sha256": "a" * 64, "text_sha256": "8" * 64,
+        "char_count": 4, "line_count": 1, "generated_at": "2026-07-22T00:00:00Z",
+        "text_path": "chapters/0008.txt", "zip_path": "ready/0008.zip", "duplicate_of": None,
+    }, "正文内容")
+    db.create_publication_plan(
+        row["book_id"], timezone="Asia/Shanghai", daily_limit=9999,
+        default_slot="20:00", ai_policy="remember", plan_id="api-recovery",
+        items=[{
+            "chapter_no": 8, "text_sha256": "8" * 64, "title": "第8章",
+            "quota_units": 4, "publication_date": "2026-07-25",
+            "publication_time": "20:00", "status": "planned",
+        }],
+    )
+    db.approve_publication_plan("api-recovery")
+    for event_type in ("automation_started", "filled", "next_clicked"):
+        db.record_event(row["book_id"], 8, event_type, "8" * 64, {"plan_id": "api-recovery"})
+    db.record_event(row["book_id"], 8, "blocked", "8" * 64, {
+        "plan_id": "api-recovery", "error": "automation_blocked",
+    })
+    client = TestClient(create_app(cfg, db))
+    headers = {"X-Ainovel-Token": "secret"}
+
+    chapter = client.get(f"/api/v1/books/{row['book_id']}/chapters/8", headers=headers).json()
+    assert chapter["recovery"]["allowed"] is True
+    assert chapter["recovery"]["last_checkpoint"] == "next_clicked"
+    response = client.post(
+        f"/api/v1/books/{row['book_id']}/chapters/8/recover-unsubmitted",
+        headers=headers,
+        json={
+            "text_sha256": "8" * 64,
+            "acknowledgement": "platform_checked_chapter_absent",
+            "platform_found": False,
+            "evidence_url": "https://fanqienovel.com/main/writer/chapter-manage/1234567890123",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["chapter"]["status"] == "ready"

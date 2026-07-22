@@ -381,3 +381,77 @@ def test_stable_platform_work_id_allows_local_and_fanqie_titles_to_differ():
         mismatch = invoke_action(page, {"type": "inspectPage", "workId": "7999999999999999999"})
         assert mismatch["workMatches"] is False
         browser.close()
+
+
+def test_next_dialog_is_explicit_publication_transition_and_final_submit_is_separate():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content(publication_flow_html())
+        page.add_script_tag(path=str(SCRIPT))
+        chapter = {"chapter_no": 6, "title": "第六章 来客", "body": "正文内容", "text_sha256": "f" * 64, "char_count": 4}
+        assert invoke_action(page, {"type": "fillChapter", "chapter": chapter})["ok"] is True
+        assert invoke_action(page, {"type": "clickNext", "chapter": chapter})["ok"] is True
+        transition = invoke_action(page, {"type": "inspectPage"})
+        assert transition["publicationFlowReady"] is True
+        assert transition["typoPrompt"] is True
+
+        prepared = invoke_action(page, {
+            "type": "completePublicationFlow",
+            "options": {
+                "chapterNo": 6, "publicationDate": "2026-07-23",
+                "publicationTime": "20:00", "aiPolicy": "no", "deferFinalSubmit": True,
+            },
+        })
+        assert prepared["ok"] is True
+        assert prepared["code"] == "publication_ready"
+        assert "定时发布成功" not in page.locator("#publish-settings").inner_text()
+
+        submitted = invoke_action(page, {
+            "type": "submitPreparedPublication",
+            "options": {
+                "chapterNo": 6, "publicationDate": "2026-07-23",
+                "publicationTime": "20:00", "aiPolicy": "no",
+            },
+        })
+        assert submitted["ok"] is True
+        assert submitted["finalSubmitAttempted"] is True
+        assert "定时发布成功" in page.locator("#publish-settings").inner_text()
+        browser.close()
+
+
+def test_failure_after_final_submit_is_marked_ambiguous_not_recoverable():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content(publication_flow_html())
+        page.add_script_tag(path=str(SCRIPT))
+        chapter = {"chapter_no": 6, "title": "第六章 来客", "body": "正文内容", "text_sha256": "f" * 64, "char_count": 4}
+        assert invoke_action(page, {"type": "fillChapter", "chapter": chapter})["ok"] is True
+        assert invoke_action(page, {"type": "clickNext", "chapter": chapter})["ok"] is True
+        prepared = invoke_action(page, {
+            "type": "completePublicationFlow",
+            "options": {
+                "chapterNo": 6, "publicationDate": "2026-07-23",
+                "publicationTime": "20:00", "aiPolicy": "no", "deferFinalSubmit": True,
+            },
+        })
+        assert prepared["ok"] is True
+        page.evaluate("""
+          document.querySelector('#schedule').onclick = () => {
+            const risk = document.createElement('div');
+            risk.setAttribute('role', 'dialog');
+            risk.textContent = '安全验证';
+            document.body.appendChild(risk);
+          };
+        """)
+        result = invoke_action(page, {
+            "type": "submitPreparedPublication",
+            "options": {
+                "chapterNo": 6, "publicationDate": "2026-07-23",
+                "publicationTime": "20:00", "aiPolicy": "no",
+            },
+        })
+        assert result["ok"] is False
+        assert result["finalSubmitAttempted"] is True
+        browser.close()

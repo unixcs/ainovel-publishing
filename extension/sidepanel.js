@@ -1,6 +1,9 @@
 "use strict";
 
-const state = { books: [], chapters: [], selected: null, plans: [], currentPlan: null, publication: null, localSettings: null, platformSnapshot: null };
+const state = {
+  books: [], chapters: [], selected: null, plans: [], currentPlan: null,
+  publication: null, localSettings: null, platformSnapshot: null, localChapterCount: 0
+};
 const $ = (id) => document.getElementById(id);
 
  document.addEventListener("DOMContentLoaded", async () => {
@@ -119,7 +122,7 @@ async function loadPlans() {
   const response = await send({ type: "getPlans", bookId });
   if (!response.ok) return setStatus("计划读取失败", response.error, "danger");
   state.plans = response.result.plans || [];
-  state.currentPlan = state.plans[0] || null;
+  state.currentPlan = state.plans.find((plan) => ["draft", "approved"].includes(plan.status)) || null;
   renderPlan();
 }
 
@@ -187,12 +190,7 @@ function renderPreview(chapter) {
   $("autoPublishChapter").disabled = !(
     state.currentPlan?.status === "approved" && ["planned", "awaiting_ai_choice"].includes(item?.status)
   );
-  $("resumeBlocked").disabled = !(
-    chapter.status === "blocked" &&
-    state.currentPlan?.status === "approved" &&
-    item?.status === "blocked" &&
-    ["login_required", "work_identity_mismatch", "unknown_page_state"].includes(item?.reason)
-  );
+  $("resumeBlocked").disabled = !(chapter.status === "blocked" && chapter.recovery?.allowed);
 }
 
 function renderPlan() {
@@ -236,6 +234,7 @@ async function inspectPlatform() {
     return null;
   }
   const chapterNos = (all.result.chapters || []).map((item) => item.chapter_no);
+  state.localChapterCount = chapterNos.length;
   setStatus("正在刷新番茄状态…", "只读取章节列表，不会修改页面。", "neutral");
   const response = await send({ type: "inspectPlatform", bookId, chapterNos });
   button.disabled = false;
@@ -249,7 +248,7 @@ async function inspectPlatform() {
   const foundRows = (state.platformSnapshot.rows || []).filter((row) => row.found);
   setStatus(
     "番茄状态已刷新",
-    `识别到 ${foundRows.length} 个平台章节。蓝色“平台已有”不是错误，插件不会重复提交。`,
+    `番茄平台已有 ${foundRows.length} 章；本地账本共有 ${state.localChapterCount} 章。这里只显示平台记录，不是本地小说总章数。`,
     "ok"
   );
   await loadChapters();
@@ -261,7 +260,7 @@ function renderPlatformSummary() {
   const element = $("platformSummary");
   const rows = (state.platformSnapshot?.rows || []).filter((row) => row.found);
   if (!rows.length) {
-    element.textContent = "当前页面没有识别到章节记录。";
+    element.textContent = `番茄平台当前没有识别到章节记录。本地账本共有 ${state.localChapterCount || "—"} 章。`;
     element.className = "platform-summary warn";
     return;
   }
@@ -269,10 +268,11 @@ function renderPlatformSummary() {
     .filter((row) => row.scheduled || row.published || row.reviewing || row.draft)
     .sort((a, b) => Number(a.chapterNo) - Number(b.chapterNo));
   const shown = relevant.slice(-8);
-  element.textContent = shown.map((row) => {
+  const rowsText = shown.map((row) => {
     const when = row.publicationDate ? ` · ${row.publicationDate}${row.publicationTime ? ` ${row.publicationTime}` : ""}` : "";
     return `第 ${row.chapterNo} 章 · ${platformRowLabel(row)}${when}`;
   }).join("\n") || `识别到 ${rows.length} 个章节记录。`;
+  element.textContent = `番茄平台已有 ${rows.length} 章（不是本地总章数）· 本地 ${state.localChapterCount || "—"} 章\n${rowsText}`;
   element.className = "platform-summary ok";
 }
 
@@ -333,6 +333,17 @@ async function smartRunNext() {
 async function smartProcessSelected() {
   if (!state.selected) return;
   const chapter = state.selected;
+  if (chapter.status === "blocked") {
+    if (chapter.recovery?.allowed) {
+      await recoverBlockedChapter(chapter.chapter_no, { rerun: true });
+    } else {
+      const checked = await inspectPlatform();
+      if (checked) {
+        setActionResult("这次可能已经点过最终提交，系统只核对结果，不会重复新建。请按番茄平台显示处理。", "warn");
+      }
+    }
+    return;
+  }
   if (chapter.status === "awaiting_ai_choice") {
     const item = currentPlanItem(chapter.chapter_no);
     if (state.currentPlan?.status === "approved" && item?.status === "awaiting_ai_choice") {
@@ -369,6 +380,12 @@ async function prepareAndRun(chapterNo) {
   if (!plan) { primaryButton.disabled = false; return; }
   const blocker = (plan.items || []).find((item) => item.status === "blocked");
   if (blocker) {
+    const detail = await send({ type: "getChapter", bookId: $("bookSelect").value, chapterNo: blocker.chapter_no });
+    if (detail.ok && detail.result?.recovery?.allowed) {
+      primaryButton.disabled = false;
+      await recoverBlockedChapter(blocker.chapter_no, { rerun: true });
+      return;
+    }
     const instruction = blockerInstruction(blocker);
     setActionResult(instruction, "warn");
     setStatus("先处理一个问题", instruction, "warn");
@@ -431,46 +448,55 @@ async function autoPublishSelected() {
 }
 
 async function resumeBlockedSelected() {
-  if (!state.selected || !state.currentPlan) return;
-  const item = currentPlanItem(state.selected.chapter_no);
-  if (state.selected.status !== "blocked" || item?.status !== "blocked") {
-    return setActionResult("当前章节不是可解除的运行时阻塞项。", "warn");
+  if (!state.selected) return;
+  await recoverBlockedChapter(state.selected.chapter_no, { rerun: false });
+}
+
+async function recoverBlockedChapter(chapterNo, { rerun = false } = {}) {
+  const bookId = $("bookSelect").value;
+  const detail = await send({ type: "getChapter", bookId, chapterNo });
+  if (!detail.ok) return setStatus("章节读取失败", detail.error, "danger");
+  const chapter = detail.result;
+  if (chapter.status !== "blocked" || !chapter.recovery?.allowed) {
+    const message = chapter.recovery?.reason === "final_submission_requires_reconciliation"
+      ? "这次可能已经执行最终提交，只能核对番茄结果，不能重新新建。"
+      : "当前章节没有可安全恢复的提交前任务。";
+    setActionResult(message, "warn");
+    return setStatus("不能直接重试", message, "warn");
   }
 
-  setStatus("正在核对平台…", "请保持番茄章节管理/章节列表页面处于打开状态。", "neutral");
-  const checked = await send({
-    type: "inspectPlatform",
-    bookId: state.selected.book_id,
-    chapterNos: [state.selected.chapter_no]
-  });
-  if (!checked.ok) return setStatus("无法解除阻塞", checked.error, "danger");
-
-  const platformRow = (checked.result.snapshot.rows || []).find((row) => Number(row.chapterNo) === Number(state.selected.chapter_no));
-  if (platformRow?.found) {
+  setStatus("正在确认番茄没有这一章…", "只读取章节管理列表，不会修改页面。", "neutral");
+  const checked = await send({ type: "inspectPlatform", bookId, chapterNos: [chapterNo] });
+  if (!checked.ok) return setStatus("无法确认平台状态", "请打开当前作品的章节管理页后再试。", "warn");
+  const row = (checked.result.snapshot.rows || []).find((entry) => Number(entry.chapterNo) === Number(chapterNo));
+  if (row?.found) {
     await connectAndLoad();
-    return setStatus(
-      "平台仍有该章记录，未解除阻塞",
-      "请先打开该章核对正文和定时状态；系统不会冒险重复创建。",
-      "warn"
-    );
+    setActionResult(`番茄已经存在第 ${chapterNo} 章，插件不会重复创建。`, "warn");
+    return setStatus("平台已有该章", "请打开这一章核对正文或定时状态。", "warn");
   }
 
   const confirmed = window.confirm(
-    `请确认：你已在番茄章节管理页核对，第 ${state.selected.chapter_no} 章没有草稿、定时或已发布记录。\n\n确认后才允许重新执行。`
+    `番茄章节管理列表中没有第 ${chapterNo} 章，而且这次没有执行最终提交。\n\n点击“确定”后，插件会清除这次未完成记录并重新处理本章。`
   );
-  if (!confirmed) return setStatus("保持阻塞", "没有进行任何重试。", "warn");
-
-  const resumed = await send({
-    type: "resumePlanItem",
-    planId: state.currentPlan.plan_id,
-    chapterNo: state.selected.chapter_no,
-    textSha256: state.selected.text_sha256
+  if (!confirmed) return setStatus("没有重试", "未修改本地账本和番茄页面。", "warn");
+  const recovered = await send({
+    type: "recoverUnsubmittedChapter",
+    bookId,
+    chapterNo,
+    textSha256: chapter.text_sha256,
+    evidenceUrl: checked.result.snapshot.url || null
   });
-  if (!resumed.ok) return setStatus("解除阻塞失败", resumed.error, "danger");
-  state.currentPlan = resumed.result;
-  setActionResult(`第 ${state.selected.chapter_no} 章已恢复为 planned，可再次执行。`, "ok");
-  setStatus("已解除阻塞", "仅恢复执行资格，没有修改番茄页面。", "ok");
+  if (!recovered.ok) {
+    const message = friendlyError(recovered.error);
+    setActionResult(message, "danger");
+    return setStatus("恢复失败", message, "danger");
+  }
+
+  setActionResult(`第 ${chapterNo} 章上次没有最终提交，已安全恢复。`, "ok");
+  setStatus("已恢复本章", rerun ? "正在重新计算日期并继续处理。" : "可使用主按钮重新处理。", "ok");
   await connectAndLoad();
+  if (rerun) await prepareAndRun(chapterNo);
+  return recovered.result;
 }
 
 async function runAutomation(item) {
@@ -589,6 +615,8 @@ function primaryActionForChapter(chapter) {
   if (["filled", "fill_started"].includes(chapter.status)) return { label: "继续发布本章", disabled: false };
   if (["ready", "synced", "planned"].includes(chapter.status)) return { label: "自动发布本章", disabled: false };
   if (chapter.status === "awaiting_ai_choice") return { label: "AI 已选择，继续发布", disabled: false };
+  if (chapter.status === "blocked" && chapter.recovery?.allowed) return { label: "恢复并重新处理本章", disabled: false };
+  if (chapter.status === "blocked") return { label: "核对最终提交结果", disabled: false };
   return { label: "需要人工确认", disabled: true };
 }
 
@@ -647,7 +675,10 @@ function friendlyError(error) {
   const labels = {
     plan_contains_blocked_items: "排程中还有必须先处理的章节。",
     no_plannable_chapters: "当前没有需要排程的章节。",
-    daily_limit_exceeds_configured_safety_cap: "每日上限不能超过 9999 字。"
+    daily_limit_exceeds_configured_safety_cap: "每日上限不能超过 9999 字。",
+    final_submission_requires_reconciliation: "这次可能已经执行最终提交，必须先核对番茄结果。",
+    platform_state_requires_reconciliation: "番茄已有该章记录，不能重复新建。",
+    recovery_acknowledgement_required: "需要先确认番茄章节列表里没有这一章。"
   };
   return labels[value] || value;
 }

@@ -26,7 +26,7 @@ Ainovel source chapters
 
 ## Current status
 
-Version `0.3.0` adds a checkpoint-driven one-button workflow: existing platform rows are safely reserved instead of shown as global failures, filled editors can resume after an exact content check, and asynchronous Fanqie editors are awaited instead of requiring a second click. It retains the quota planner, durable plans, manual-AI pause, scheduled submission, read-back verification, and fail-closed safety boundaries. Automatic execution defaults to **off** until the live Fanqie selectors are validated on the installed Edge profile. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for the staged rollout and [`docs/plan-boundaries.md`](docs/plan-boundaries.md) for the confirmed grill-with-docs boundaries.
+Version `0.3.1` fixes the live chapter-8 deadlock by separating “Next” from Fanqie's final scheduled-publish boundary. A stopped pre-submit run can be recovered after a fresh platform absence check, while an armed final submission remains fail-closed. The release also keeps exactly one active plan per work and lets the known typo/full-check transition continue without the redundant timeout that caused the false stop. Automatic execution defaults to **off** until a live run completes platform read-back. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for rollout and [`docs/plan-boundaries.md`](docs/plan-boundaries.md) for the confirmed boundaries.
 
 ## Repository layout
 
@@ -67,6 +67,8 @@ See [`extension/README.md`](extension/README.md). Load `extension/` as an unpack
 - A chapter-list row reserves quota and is skipped without duplicate submission; it is not claimed as the current source version until title/body reconciliation succeeds.
 - Source-version conflicts, quota ambiguity, unknown page states, login expiry, CAPTCHA, and risk-control prompts stop the run.
 - A click is never recorded as success until Fanqie read-back verifies the intended chapter and schedule/publication state.
+- “Next” is recoverable after platform absence verification; once final submission is armed, a missing result is never blindly retried.
+- Exactly one approved plan can drive a work, so stale plan snapshots cannot race later chapters.
 - Credentials and browser login state remain local; the server never operates the Fanqie browser session.
 - The full ZIP is only a bootstrap, backup, and recovery channel; normal synchronization is incremental.
 

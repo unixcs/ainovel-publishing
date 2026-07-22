@@ -250,3 +250,108 @@ def test_observed_schedule_requires_separate_chapter_version_verification(tmp_pa
     schedule = db.list_verified_schedules(row["book_id"])[0]
     assert schedule["text_sha256"] == "6" * 64
     assert schedule["version_verified"] is True
+
+
+def _approved_single_item_plan(db: PublishingDB, row: dict, plan_id: str = "recovery-plan") -> None:
+    db.create_publication_plan(
+        row["book_id"], timezone="Asia/Shanghai", daily_limit=9999,
+        default_slot="20:00", ai_policy="remember", plan_id=plan_id,
+        items=[{
+            "chapter_no": row["chapter_no"], "text_sha256": row["text_sha256"],
+            "title": row["title"], "quota_units": 4,
+            "publication_date": "2026-07-25", "publication_time": "20:00",
+            "status": "planned",
+        }],
+    )
+    db.approve_publication_plan(plan_id)
+
+
+def test_next_clicked_without_final_submit_can_recover_after_platform_absence(tmp_path: Path):
+    db = PublishingDB(tmp_path / "publisher.db")
+    row = db.upsert_manifest_entry("示例小说", entry(8, "8" * 64), "body")
+    _approved_single_item_plan(db, row)
+    payload = {"plan_id": "recovery-plan"}
+    db.record_event(row["book_id"], 8, "automation_started", "8" * 64, payload)
+    db.record_event(row["book_id"], 8, "filled", "8" * 64, payload)
+    db.record_event(row["book_id"], 8, "next_clicked", "8" * 64, payload)
+    db.record_event(row["book_id"], 8, "blocked", "8" * 64, {**payload, "error": "automation_blocked"})
+
+    recovery = db.get_chapter_recovery(row["book_id"], 8)
+    assert recovery == {
+        "allowed": True,
+        "mode": "recover_unsubmitted",
+        "reason": "platform_absence_check_required",
+        "last_checkpoint": "next_clicked",
+        "plan_id": "recovery-plan",
+    }
+    recovered = db.recover_unsubmitted_chapter(
+        row["book_id"], 8, "8" * 64,
+        acknowledgement="platform_checked_chapter_absent",
+        platform_found=False,
+        evidence_url="https://fanqienovel.com/main/writer/chapter-manage/1234567890123",
+    )
+    assert recovered["chapter"]["status"] == "ready"
+    assert recovered["recovery"]["allowed"] is False
+    assert recovered["superseded_plan_ids"] == ["recovery-plan"]
+    assert db.get_publication_plan("recovery-plan")["status"] == "superseded"
+    assert [event["event_type"] for event in db.list_events(row["book_id"], 8)][-2:] == [
+        "platform_absence_observed", "recovered_unsubmitted",
+    ]
+
+
+def test_final_submit_armed_cannot_return_to_new_chapter_flow(tmp_path: Path):
+    db = PublishingDB(tmp_path / "publisher.db")
+    row = db.upsert_manifest_entry("示例小说", entry(8, "8" * 64), "body")
+    _approved_single_item_plan(db, row)
+    payload = {"plan_id": "recovery-plan"}
+    for event_type in ("automation_started", "filled", "next_clicked", "final_submit_armed"):
+        db.record_event(row["book_id"], 8, event_type, "8" * 64, payload)
+    assert db.get_chapter(row["book_id"], 8)["status"] == "submitted"
+    assert db.get_publication_plan("recovery-plan")["items"][0]["status"] == "submitted"
+    db.record_event(row["book_id"], 8, "blocked", "8" * 64, {**payload, "error": "submission_unverified"})
+
+    recovery = db.get_chapter_recovery(row["book_id"], 8)
+    assert recovery["allowed"] is False
+    assert recovery["reason"] == "final_submission_requires_reconciliation"
+    assert recovery["last_checkpoint"] == "final_submit_armed"
+    with pytest.raises(ValueError, match="final_submission_requires_reconciliation"):
+        db.recover_unsubmitted_chapter(
+            row["book_id"], 8, "8" * 64,
+            acknowledgement="platform_checked_chapter_absent",
+            platform_found=False,
+        )
+
+
+def test_schedule_submitted_cannot_be_recovered_as_unsubmitted(tmp_path: Path):
+    db = PublishingDB(tmp_path / "publisher.db")
+    row = db.upsert_manifest_entry("示例小说", entry(8, "8" * 64), "body")
+    _approved_single_item_plan(db, row)
+    payload = {"plan_id": "recovery-plan"}
+    db.record_event(row["book_id"], 8, "automation_started", "8" * 64, payload)
+    db.record_event(row["book_id"], 8, "schedule_submitted", "8" * 64, payload)
+    db.record_event(row["book_id"], 8, "blocked", "8" * 64, {**payload, "error": "readback_unknown"})
+    assert db.get_chapter_recovery(row["book_id"], 8)["reason"] == "final_submission_requires_reconciliation"
+
+
+def test_only_newest_draft_and_one_approved_plan_stay_active(tmp_path: Path):
+    db = PublishingDB(tmp_path / "publisher.db")
+    row = db.upsert_manifest_entry("示例小说", entry(8, "8" * 64), "body")
+    item = [{
+        "chapter_no": 8, "text_sha256": "8" * 64, "title": "第8章",
+        "quota_units": 4, "publication_date": "2026-07-25",
+        "publication_time": "20:00", "status": "planned",
+    }]
+    for plan_id in ("first", "second"):
+        db.create_publication_plan(
+            row["book_id"], timezone="Asia/Shanghai", daily_limit=9999,
+            default_slot="20:00", ai_policy="remember", plan_id=plan_id, items=item,
+        )
+    assert db.get_publication_plan("first")["status"] == "superseded"
+    db.approve_publication_plan("second")
+    db.create_publication_plan(
+        row["book_id"], timezone="Asia/Shanghai", daily_limit=9999,
+        default_slot="20:00", ai_policy="remember", plan_id="third", items=item,
+    )
+    db.approve_publication_plan("third")
+    assert db.get_publication_plan("second")["status"] == "superseded"
+    assert db.get_publication_plan("third")["status"] == "approved"

@@ -49,6 +49,7 @@ const PAGE_ACTIONS = new Set([
   "openNewChapter",
   "clickNext",
   "completePublicationFlow",
+  "submitPreparedPublication",
   "inspectPublicationList"
 ]);
 
@@ -75,6 +76,8 @@ async function dispatchPageAction(message) {
       return await clickNext(message.chapter);
     case "completePublicationFlow":
       return completePublicationFlow(message.options || {});
+    case "submitPreparedPublication":
+      return submitPreparedPublication(message.options || {});
     case "inspectPublicationList":
       return inspectPublicationList(message.chapterNos || []);
     default:
@@ -407,6 +410,9 @@ function inspectPage(expectedBookName = null, expectedWorkId = null) {
   const fields = locateFields();
   const loginRequired = isLoginPage(body);
   const publishSettings = hasPublicationSettings(body);
+  const typoPrompt = Boolean(findTypoDialog());
+  const fullCheckReady = Boolean(findActionButton(["全面检测"]).element);
+  const publicationFlowReady = publishSettings || typoPrompt || fullCheckReady;
   const editor = Boolean(fields.titleField && fields.editor);
   const writer = isWriterPage(body);
   let state = "unknown";
@@ -427,6 +433,9 @@ function inspectPage(expectedBookName = null, expectedWorkId = null) {
     writer,
     editor,
     publishSettings,
+    typoPrompt,
+    fullCheckReady,
+    publicationFlowReady,
     expectedBookName,
     expectedWorkId,
     currentWorkId,
@@ -473,11 +482,11 @@ async function clickNext(chapter) {
 }
 
 async function completePublicationFlow(options) {
-  const deadline = Date.now() + 8_000;
+  const deadline = Date.now() + AUTOMATION_LIMITS.transitionMs;
   const transition = await waitFor(() => {
     const riskDialog = findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu);
     if (riskDialog) return { blocked: true };
-    const typoDialog = findKnownDialog(/错别字|错字/iu);
+    const typoDialog = findTypoDialog();
     if (typoDialog) return { value: { kind: "typo", root: typoDialog } };
     if (findActionButton(["全面检测"]).element || hasPublicationSettings(visiblePageText())) {
       return { value: { kind: "ready" } };
@@ -490,7 +499,7 @@ async function completePublicationFlow(options) {
     const submit = findButtonInRoot(transition.value.root, ["提交"]);
     if (!submit.element) return failure("已识别错别字提示，但没有找到同一弹窗内的提交按钮。", "typo_submit_missing");
     clickVisible(submit.element);
-    const disappeared = await waitFor(() => !findKnownDialog(/错别字|错字/iu), Date.now() + 8_000);
+    const disappeared = await waitFor(() => !findTypoDialog(), Date.now() + 8_000);
     if (!disappeared.value) return failure("错别字提示提交后没有消失，已停止。", "typo_dialog_not_closed");
   }
 
@@ -529,6 +538,31 @@ async function completePublicationFlow(options) {
 
   const submit = findButtonInRoot(settings, ["定时发布", "确认发布", "提交发布", "发布"]);
   if (!submit.element) return failure("发布设置中没有找到可验证的最终提交按钮。", "final_submit_missing");
+  if (options.deferFinalSubmit) {
+    return {
+      ok: true,
+      code: "publication_ready",
+      publicationDate: scheduleResult.publicationDate,
+      publicationTime: scheduleResult.publicationTime,
+      aiPolicy: aiResult.policy,
+      evidence: normalizeBody(readField(settings)).slice(0, 1000),
+      url: location.href
+    };
+  }
+  return submitPreparedPublication(options);
+}
+
+async function submitPreparedPublication(options) {
+  const settings = findPublicationRoot();
+  if (!settings) return failure("没有识别到已经准备好的发布设置区域。", "publish_settings_missing");
+  const contextResult = verifyPublicationContext(settings, options);
+  if (!contextResult.ok) return contextResult;
+  const aiResult = configureAiPolicy(settings, options.aiPolicy || "remember");
+  if (!aiResult.ok) return aiResult;
+  const scheduleResult = configureSchedule(settings, options.publicationDate, options.publicationTime);
+  if (!scheduleResult.ok) return scheduleResult;
+  const submit = findButtonInRoot(settings, ["定时发布", "确认发布", "提交发布", "发布"]);
+  if (!submit.element) return failure("发布设置中没有找到可验证的最终提交按钮。", "final_submit_missing");
   const beforeSubmitText = visiblePageText();
   clickVisible(submit.element);
 
@@ -541,8 +575,16 @@ async function completePublicationFlow(options) {
     const scheduleEvidence = text.includes(String(options.publicationDate || "")) || text.includes(String(options.publicationTime || "")) || text.includes(String(options.chapterNo || ""));
     return successText && changed && (scheduleEvidence || !hasPublicationSettings(text));
   }, Date.now() + AUTOMATION_LIMITS.successMs);
-  if (success.blocked) return failure("最终提交后出现风险控制或验证码，结果未知。", "risk_control_detected");
-  if (!success.value) return failure("最终提交后未读取到可验证的成功/定时状态，结果未知。", "submission_unverified");
+  if (success.blocked) return failure(
+    "最终提交后出现风险控制或验证码，结果未知。",
+    "risk_control_detected",
+    { finalSubmitAttempted: true }
+  );
+  if (!success.value) return failure(
+    "最终提交后未读取到可验证的成功/定时状态，结果未知。",
+    "submission_unverified",
+    { finalSubmitAttempted: true }
+  );
 
   return {
     ok: true,
@@ -550,6 +592,7 @@ async function completePublicationFlow(options) {
     publicationDate: options.publicationDate || null,
     publicationTime: options.publicationTime || null,
     aiPolicy: aiResult.policy,
+    finalSubmitAttempted: true,
     evidence: visiblePageText().slice(0, 1000),
     url: location.href
   };
@@ -749,8 +792,26 @@ function findPublicationRoot() {
   return candidates[0] || null;
 }
 
+function findTypoDialog() {
+  const known = findKnownDialog(/错别字|错字/iu);
+  if (known) return known;
+  // Some Fanqie releases use an unlabelled ByteDance overlay. Accept only the
+  // smallest visible container that has both the exact prompt meaning and its own
+  // Submit button, so page prose containing “错别字” cannot be mistaken for a dialog.
+  const candidates = [...document.querySelectorAll("section, article, div")]
+    .filter(isVisible)
+    .filter((element) => {
+      const text = normalizeBody(readField(element));
+      return text.length <= 1000 && /错别字|错字/iu.test(text) && Boolean(findButtonInRoot(element, ["提交"]).element);
+    })
+    .sort((a, b) => readField(a).length - readField(b).length);
+  return candidates[0] || null;
+}
+
 function findKnownDialog(pattern) {
-  const candidates = [...document.querySelectorAll("[role='dialog'], .modal, .dialog, [class*='modal'], [class*='dialog']")]
+  const candidates = [...document.querySelectorAll(
+    "[role='dialog'], [aria-modal='true'], .modal, .dialog, [class*='modal'], [class*='dialog'], [class*='popup'], [class*='confirm'], [class*='message-box']"
+  )]
     .filter(isVisible)
     .filter((element) => pattern.test(normalizeBody(readField(element))));
   return candidates.sort((a, b) => readField(a).length - readField(b).length)[0] || null;

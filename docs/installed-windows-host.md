@@ -14,19 +14,29 @@ Verified on **2026-07-22**.
 
 ## Installed release
 
-- Companion and extension version: `0.3.0`
+- Companion and extension files: `0.3.1`
+- Companion health: `0.3.1`; SQLite integrity: `ok`; chapter ledger: `142` rows
+- Packaged EXE SHA256: `1e4e08b97183f0e88016c41d0baf1f15628cc4690946db69d6486c498a7c7aad`
+- Windows-native companion tests: `37` passed; combined companion/extension suite: `56` passed
 - Publication timezone: `Asia/Shanghai`
 - Daily safety cap: `9999`
 - Allowed slots: `12:00`, `20:00`, `22:00`; default `20:00`
-- Automatic execution: disabled until live selector acceptance succeeds
-- SQLite publication-plan tables initialized without replacing the existing chapter ledger
-- `tzdata` is bundled in the PyInstaller executable and plan creation was smoke-tested on Windows
-- Packaged EXE SHA256: `4714732c0371d8842b7e1caa7a559dce0000e174f2793d2c8980abd4c4c7ec1e`
-- Runtime health: `0.3.0`; SQLite integrity: `ok`; chapter ledger: `142` rows
-- Existing API token, configuration, SSH paths, Chinese release paths and database were preserved
-- Pre-upgrade backup: `D:\Program\soft\code\demo\AinovelPublisher\backups\20260722-215306-pre-0.3`
+- Automatic execution remains disabled until one live `0.3.1` platform read-back succeeds
+- Existing API token, configuration, SSH paths, Chinese release paths, database, and downloaded chapters were preserved
+- Pre-upgrade backup: `D:\Program\soft\code\demo\AinovelPublisher\backups\20260722-225030-pre-0.3.1`
 
 The two `ainovel-publisher.exe` process rows shown by Windows are the normal PyInstaller one-file parent/child pair for one service instance, not two independent assistants.
+
+## Chapter-8 recovery applied
+
+The ledger proved that chapter 8 reached `next_clicked` but never reached `final_submit_armed` or `schedule_submitted`. The user also confirmed that a fresh Fanqie chapter-management scan had no chapter-8 row. The authenticated `recover-unsubmitted` API therefore recorded the platform absence and recovery events, changed chapter 8 from `blocked` to `ready`, cleared its old error, and superseded all 38 stale draft/approved plan snapshots. The database was not edited by hand.
+
+The new boundary is:
+
+- editor fill, “Next”, typo confirmation, and full inspection are pre-submit and recoverable after a live absence check;
+- `final_submit_armed` is written before the final scheduled-publish action is sent;
+- at or beyond that checkpoint, an unknown result stays fail-closed and cannot be recreated blindly;
+- only one approved publication plan can drive a work.
 
 ## Startup
 
@@ -40,6 +50,11 @@ It starts `serve --sync-first` hidden at Windows login. A failed initial synchro
 
 ## Edge rollout gate
 
-The unpacked extension already points at the installed `extension` directory. After source replacement, restart the companion and use Edge's extension page to click **Reload**. Keep background automatic execution off for the first live run. Refresh the chapter list, then use the single “process chapter” action; existing rows are quota reservations and are not submitted again.
+The unpacked extension directory now contains `0.3.1`, but an already-open Edge extension/service worker and Fanqie tab keep the old scripts until reloaded. The remaining user actions are:
 
-API tokens, the SQLite database, downloaded manuscripts, backups, and compiled executables are runtime-only and are not committed to Git.
+1. Open `edge://extensions`, click **Reload** on Ainovel 番茄发布助手.
+2. Refresh the existing Fanqie chapter-management tab once.
+3. Confirm the side panel reports companion `0.3.1`.
+4. Keep background automatic execution off and click `自动处理下一章` once.
+
+Chapter 8 is already `ready`; no manual “解除阻塞”, SQLite edit, or old-plan approval is needed. API tokens, SQLite data, manuscripts, backups, and compiled executables remain runtime-only and are not committed to Git.

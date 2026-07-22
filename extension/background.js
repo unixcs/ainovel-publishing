@@ -12,7 +12,7 @@ const DEFAULT_SETTINGS = {
 const TARGET_ROOT_HOST = "fanqienovel.com";
 const WRITER_URL = "https://fanqienovel.com/main/writer/";
 const AUTOMATION_ALARM = "ainovel-publication-runner";
-const AUTOMATION_SAFETY_EPOCH = "0.3.0-simplified-safe-flow";
+const AUTOMATION_SAFETY_EPOCH = "0.3.1-recoverable-pre-submit-flow";
 let automationLock = false;
 const safetyReady = enforceAutomationSafetyEpoch();
 
@@ -88,6 +88,19 @@ async function handleMessage(message) {
           body: {
             text_sha256: String(message.textSha256 || ""),
             acknowledgement: "platform_checked_no_submission"
+          }
+        }
+      );
+    case "recoverUnsubmittedChapter":
+      return apiRequest(
+        `/api/v1/books/${encodeURIComponent(message.bookId)}/chapters/${Number(message.chapterNo)}/recover-unsubmitted`,
+        {
+          method: "POST",
+          body: {
+            text_sha256: String(message.textSha256 || ""),
+            acknowledgement: "platform_checked_chapter_absent",
+            platform_found: false,
+            evidence_url: message.evidenceUrl || null
           }
         }
       );
@@ -202,6 +215,7 @@ async function automateChapter(bookId, chapterNo, planId) {
   automationLock = true;
   let activeChapter = null;
   let pageMutationStarted = false;
+  let finalSubmissionArmed = false;
   try {
     if (!planId) throw new Error("自动发布必须绑定已批准的发布计划。");
     const [chapter, plan] = await Promise.all([
@@ -301,7 +315,10 @@ async function automateChapter(bookId, chapterNo, planId) {
     if (!next?.ok) throw automationFailure(next?.error || "点击下一步前校验失败。", next?.code || "next_failed", next);
     await safePostEvent(bookId, chapterNo, "next_clicked", chapter.text_sha256, { plan_id: planId });
 
-    const postNextTab = await waitForPublicationTab(editorTab.id, 20_000, expectedWorkId);
+    // Fanqie reveals the typo prompt/full-check flow in the same editor tab. Let the
+    // page adapter observe that transition directly; waiting for a separately classified
+    // "publication tab" was the false timeout that stranded chapter 8 after Next.
+    const postNextTab = await chrome.tabs.get(editorTab.id);
     const resolvedAiPolicy = await resolveAiPolicy(bookId, plan.ai_policy);
     const publication = await sendPageAction(postNextTab.id, {
       type: "completePublicationFlow",
@@ -310,7 +327,8 @@ async function automateChapter(bookId, chapterNo, planId) {
         publicationTime: item.publication_time,
         aiPolicy: resolvedAiPolicy,
         chapterNo,
-        title: chapter.title
+        title: chapter.title,
+        deferFinalSubmit: true
       }
     });
     if (publication?.paused && publication?.code === "ai_choice_required") {
@@ -333,12 +351,36 @@ async function automateChapter(bookId, chapterNo, planId) {
     if (!publication?.ok) {
       throw automationFailure(publication?.error || "发布流程未完成。", publication?.code || "publication_flow_failed", publication);
     }
-    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, publication);
+    const submitOptions = {
+      publicationDate: publication.publicationDate || item.publication_date,
+      publicationTime: publication.publicationTime || item.publication_time,
+      aiPolicy: resolvedAiPolicy,
+      chapterNo,
+      title: chapter.title
+    };
+    await safePostEvent(bookId, chapterNo, "final_submit_armed", chapter.text_sha256, {
+      plan_id: planId,
+      platform_state: "submitted_unverified",
+      publication_date: submitOptions.publicationDate,
+      publication_time: submitOptions.publicationTime,
+      quota_units: item.quota_units,
+      page_url: postNextTab.url
+    });
+    finalSubmissionArmed = true;
+    const submitted = await sendPageAction(postNextTab.id, {
+      type: "submitPreparedPublication",
+      options: submitOptions
+    });
+    if (!submitted?.ok) {
+      throw automationFailure(submitted?.error || "最终提交结果未知。", submitted?.code || "submission_unverified", submitted);
+    }
+    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, submitted);
   } catch (error) {
     if (activeChapter && pageMutationStarted) {
       await markBlocked(bookId, chapterNo, planId, activeChapter.text_sha256, error.code || "automation_blocked", {
         message: normalizeError(error),
-        details: error.details || null
+        details: error.details || null,
+        finalSubmissionArmed
       });
     } else if (activeChapter) {
       await safePostEvent(bookId, chapterNo, "failed", activeChapter.text_sha256, {
@@ -359,6 +401,7 @@ async function continueManualAi(bookId, chapterNo, planId) {
   if (automationLock) throw new Error("已有自动发布任务正在运行。");
   automationLock = true;
   let activeChapter = null;
+  let finalSubmissionArmed = false;
   try {
     if (!planId) throw new Error("继续发布必须绑定已批准的发布计划。");
     const [chapter, plan] = await Promise.all([
@@ -384,18 +427,43 @@ async function continueManualAi(bookId, chapterNo, planId) {
         publicationTime: item.publication_time,
         aiPolicy: "remember",
         chapterNo,
-        title: chapter.title
+        title: chapter.title,
+        deferFinalSubmit: true
       }
     });
     if (!publication?.ok) {
       throw automationFailure(publication?.error || "继续发布失败。", publication?.code || "publication_flow_failed", publication);
     }
-    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, publication);
+    const submitOptions = {
+      publicationDate: publication.publicationDate || item.publication_date,
+      publicationTime: publication.publicationTime || item.publication_time,
+      aiPolicy: "remember",
+      chapterNo,
+      title: chapter.title
+    };
+    await safePostEvent(bookId, chapterNo, "final_submit_armed", chapter.text_sha256, {
+      plan_id: planId,
+      platform_state: "submitted_unverified",
+      publication_date: submitOptions.publicationDate,
+      publication_time: submitOptions.publicationTime,
+      quota_units: item.quota_units,
+      page_url: postNextTab.url
+    });
+    finalSubmissionArmed = true;
+    const submitted = await sendPageAction(postNextTab.id, {
+      type: "submitPreparedPublication",
+      options: submitOptions
+    });
+    if (!submitted?.ok) {
+      throw automationFailure(submitted?.error || "最终提交结果未知。", submitted?.code || "submission_unverified", submitted);
+    }
+    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, submitted);
   } catch (error) {
     if (activeChapter) {
       await markBlocked(bookId, chapterNo, planId, activeChapter.text_sha256, error.code || "automation_blocked", {
         message: normalizeError(error),
-        details: error.details || null
+        details: error.details || null,
+        finalSubmissionArmed
       });
     }
     throw error;
@@ -537,29 +605,6 @@ async function waitForEditorTab(beforeIds, timeoutMs, expectedWorkId = null) {
   throw new Error("新建章节后未找到可验证的编辑页。");
 }
 
-async function waitForPublicationTab(editorTabId, timeoutMs, expectedWorkId = null) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const tabs = await chrome.tabs.query({ currentWindow: true });
-    const candidates = tabs.filter((tab) => tab.id && isFanqieUrl(tab.url) && (!expectedWorkId || extractPlatformWorkId(tab.url) === expectedWorkId));
-    for (const tab of candidates) {
-      try {
-        const page = await sendPageAction(tab.id, { type: "inspectPage" });
-        if (page?.state === "publish_settings") return tab;
-        if (page?.state === "editor" && /全面检测|错别字|发布/iu.test(page.bodyPreview || "")) return tab;
-      } catch (_error) { /* keep polling */ }
-    }
-    // Some Fanqie builds keep the same tab and reveal the dialog asynchronously.
-    try {
-      const page = await sendPageAction(editorTabId, { type: "inspectPage" });
-      if (page?.state === "publish_settings") return chrome.tabs.get(editorTabId);
-      if (page?.state === "editor" && /全面检测|错别字|发布/iu.test(page.bodyPreview || "")) return chrome.tabs.get(editorTabId);
-    } catch (_error) { /* keep polling */ }
-    await sleep(400);
-  }
-  throw new Error("下一步后未找到可验证的发布设置页面。");
-}
-
 async function findPublicationSettingsTab(expectedWorkId = null) {
   const tabs = await chrome.tabs.query({ currentWindow: true });
   const ordered = [...tabs.filter((tab) => tab.active), ...tabs.filter((tab) => !tab.active)];
@@ -600,7 +645,8 @@ async function sendPageAction(tabId, message) {
 
 async function inspectPlatform(bookId, chapterNos) {
   if (!bookId) throw new Error("缺少作品标识。");
-  const tab = await ensureWriterTab();
+  const expectedWorkId = await platformWorkIdForBook(bookId);
+  const tab = await ensureWriterTab(expectedWorkId);
   const snapshot = await sendPageAction(tab.id, { type: "inspectPublicationList", chapterNos });
   if (!snapshot?.ok) throw new Error(snapshot?.error || "读取平台章节列表失败。");
   await rememberPlatformWorkId(bookId, snapshot.url || tab.url);
@@ -689,7 +735,9 @@ async function markBlocked(bookId, chapterNo, planId, textSha256, code, details)
       plan_id: planId,
       error: code,
       stage: "automation",
-      platform_state: code === "submission_readback_unverified" ? "submitted_unverified" : undefined,
+      platform_state: (details?.finalSubmissionArmed || ["submission_readback_unverified", "submission_unverified"].includes(code))
+        ? "submitted_unverified"
+        : undefined,
       details: details || null
     });
   } catch (_error) { /* preserve original stop reason */ }
