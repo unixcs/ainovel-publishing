@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+*.exe
+*.msi
+
+# Runtime state and secrets
+config.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Generated novel/release artifacts
+downloads/
+export/
+release/
+*.zip
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ainovel 发布助手</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Ainovel 发布助手</h1>
+      <p>一次只处理一章，填充后人工检查。</p>
+    </div>
+    <span id="connectionBadge" class="badge neutral">未连接</span>
+  </header>
+
+  <details class="panel" id="settingsPanel">
+    <summary>本地助手设置</summary>
+    <label>接口地址<input id="baseUrl" value="http://127.0.0.1:8787"></label>
+    <label>API Token<input id="apiToken" type="password" autocomplete="off"></label>
+    <div class="row">
+      <button id="saveSettings">保存并测试</button>
+      <button id="syncNow" class="secondary">同步服务器</button>
+    </div>
+  </details>
+
+  <section class="panel status-panel">
+    <strong id="statusTitle">等待连接本地助手</strong>
+    <p id="statusDetail">请先启动 Windows 本地助手并填写 Token。</p>
+  </section>
+
+  <section class="panel toolbar">
+    <label>作品<select id="bookSelect"></select></label>
+    <label>状态
+      <select id="statusFilter">
+        <option value="ready">待处理</option>
+        <option value="version_conflict">版本冲突</option>
+        <option value="legacy_draft">旧草稿</option>
+        <option value="legacy_published">旧已发布</option>
+        <option value="filled">已填充</option>
+        <option value="">全部</option>
+      </select>
+    </label>
+    <button id="refreshList" class="secondary">刷新队列</button>
+  </section>
+
+  <main>
+    <section class="panel list-panel">
+      <div class="section-title"><h2>章节队列</h2><span id="queueCount">0</span></div>
+      <div id="chapterList" class="chapter-list"></div>
+    </section>
+
+    <section class="panel preview-panel">
+      <div class="section-title"><h2 id="previewTitle">未选择章节</h2><span id="previewStatus" class="badge neutral">—</span></div>
+      <p id="previewMeta" class="muted">从左侧队列选择一章。</p>
+      <pre id="previewBody"></pre>
+      <button id="reconcileChapter" class="secondary" disabled>对账当前番茄草稿</button>
+      <button id="fillChapter" disabled>填充到当前番茄编辑页</button>
+      <div id="actionResult" class="action-result neutral">尚未执行填充。</div>
+      <p class="warning">插件不会自动保存、发布或跳到下一章。</p>
+    </section>
+  </main>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

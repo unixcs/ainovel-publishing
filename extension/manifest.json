@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Ainovel 番茄发布助手",
+  "version": "0.1.1",
+  "description": "从本地 Ainovel Companion 获取章节，一次只向番茄编辑器填充一章。",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8787/*",
+    "*://fanqienovel.com/*",
+    "*://*.fanqienovel.com/*"
+  ],
+  "action": {
+    "default_title": "打开 Ainovel 发布助手"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://fanqienovel.com/*",
+        "*://*.fanqienovel.com/*"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
