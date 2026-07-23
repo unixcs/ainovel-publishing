@@ -50,8 +50,8 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 .plan-item.blocked { background:#f8ded9; color:var(--danger); }
 @media (max-width:420px) { .settings-grid { grid-template-columns:1fr; } .toolbar { grid-template-columns:1fr; } }
 
-.primary-actions { margin-bottom:9px; }
-.primary-actions button { flex:1; }
+.main-action { width:100%; padding:12px 14px; font-size:14px; }
+.read-only-action { width:100%; margin-bottom:8px; }
 .platform-summary { padding:9px 10px; border-radius:9px; font-size:12px; line-height:1.65; white-space:pre-wrap; }
 .platform-summary.neutral { background:#eee8df; color:var(--ink); }
 .platform-summary.ok { background:#dff3e9; color:var(--ok); }

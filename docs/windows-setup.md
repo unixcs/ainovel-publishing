@@ -84,8 +84,10 @@ Remove automatic startup with:
 
 ## First operation
 
-1. Open chapter 4 from the Fanqie draft box.
-2. Select chapter 4 in the extension under `legacy_draft`.
-3. Run draft reconciliation. It reads and compares but does not overwrite.
-4. Resolve any mismatch manually.
-5. Continue with chapter 5, one chapter per attempt.
+1. Start the companion and confirm the extension shows **已连接**.
+2. Log in to Fanqie Writer in the same Edge/Chrome profile.
+3. Select the work and configure the daily cap, earliest date, publication slot, and AI declaration policy.
+4. Keep background automatic execution off and click **检查并处理下一章**.
+5. Do not manually operate Fanqie while that run is active. Accept success only after the extension reports a matching platform date/time read-back.
+
+There is no separate normal step for refreshing platform state, creating a plan, approving it, or executing it. The collapsed read-only details are for diagnosis only.

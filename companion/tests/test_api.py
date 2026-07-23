@@ -2,9 +2,16 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from ainovel_companion import __version__
 from ainovel_companion.api import create_app
 from ainovel_companion.config import APIConfig, AppConfig, RemoteConfig, SSHConfig
 from ainovel_companion.db import PublishingDB
+
+
+AUTH_HEADERS = {
+    "X-Ainovel-Token": "secret",
+    "X-Ainovel-Client-Version": __version__,
+}
 
 
 def config(tmp_path: Path) -> AppConfig:
@@ -24,7 +31,13 @@ def test_api_requires_token(tmp_path: Path):
     client = TestClient(create_app(cfg, db))
     assert client.get("/api/v1/health").status_code == 200
     assert client.get("/api/v1/books").status_code == 401
-    assert client.get("/api/v1/books", headers={"X-Ainovel-Token": "secret"}).status_code == 200
+    token_only = {"X-Ainovel-Token": "secret"}
+    assert client.get("/api/v1/books", headers=token_only).status_code == 409
+    stale = {**AUTH_HEADERS, "X-Ainovel-Client-Version": "0.3.2"}
+    stale_response = client.get("/api/v1/books", headers=stale)
+    assert stale_response.status_code == 409
+    assert stale_response.json()["detail"] == f"stale_extension_version:expected={__version__}"
+    assert client.get("/api/v1/books", headers=AUTH_HEADERS).status_code == 200
 
 
 def test_publication_plan_api_and_platform_observation(tmp_path: Path):
@@ -44,7 +57,7 @@ def test_publication_plan_api_and_platform_observation(tmp_path: Path):
         "duplicate_of": None,
     }, "一二三四五六")
     client = TestClient(create_app(cfg, db))
-    headers = {"X-Ainovel-Token": "secret"}
+    headers = AUTH_HEADERS
     response = client.post(
         f"/api/v1/books/{row['book_id']}/publication-plans",
         headers=headers,
@@ -90,7 +103,7 @@ def test_platform_schedule_observation_does_not_claim_body_version(tmp_path: Pat
     client = TestClient(create_app(cfg, db))
     response = client.post(
         f"/api/v1/books/{row['book_id']}/platform-observations",
-        headers={"X-Ainovel-Token": "secret"},
+        headers=AUTH_HEADERS,
         json={"observations": [{
             "chapter_no": 6,
             "text_sha256": "6" * 64,
@@ -115,7 +128,7 @@ def test_platform_schedule_observation_does_not_claim_body_version(tmp_path: Pat
     # global stop that prevents later chapters from being planned.
     plan_response = client.post(
         f"/api/v1/books/{row['book_id']}/publication-plans",
-        headers={"X-Ainovel-Token": "secret"},
+        headers=AUTH_HEADERS,
         json={"slot": "20:00", "daily_limit": 9999, "ai_policy": "remember", "start_date": "2026-07-23"},
     )
     assert plan_response.status_code == 200
@@ -123,7 +136,7 @@ def test_platform_schedule_observation_does_not_claim_body_version(tmp_path: Pat
     assert plan["items"][0]["status"] == "reserved"
     approved = client.post(
         f"/api/v1/publication-plans/{plan['plan_id']}/approve",
-        headers={"X-Ainovel-Token": "secret"},
+        headers=AUTH_HEADERS,
     )
     assert approved.status_code == 200
 
@@ -141,7 +154,7 @@ def test_verified_schedule_requires_read_back_time(tmp_path: Path):
     client = TestClient(create_app(cfg, db))
     response = client.post(
         f"/api/v1/books/{row['book_id']}/platform-observations",
-        headers={"X-Ainovel-Token": "secret"},
+        headers=AUTH_HEADERS,
         json={"observations": [{
             "chapter_no": 6, "text_sha256": "6" * 64,
             "publication_date": "2026-07-23", "publication_time": None,
@@ -165,7 +178,7 @@ def test_plan_cannot_exceed_configured_daily_safety_cap(tmp_path: Path):
     client = TestClient(create_app(cfg, db))
     response = client.post(
         f"/api/v1/books/{row['book_id']}/publication-plans",
-        headers={"X-Ainovel-Token": "secret"},
+        headers=AUTH_HEADERS,
         json={"slot": "20:00", "daily_limit": 10000, "ai_policy": "remember"},
     )
     assert response.status_code == 422
@@ -188,7 +201,7 @@ def test_unreconciled_earlier_draft_blocks_plan_approval(tmp_path: Path):
         "text_sha256": "5" * 64, "text_path": "chapters/0005.txt", "zip_path": None,
     }, "第五章正文")
     client = TestClient(create_app(cfg, db))
-    headers = {"X-Ainovel-Token": "secret"}
+    headers = AUTH_HEADERS
     response = client.post(
         f"/api/v1/books/{fourth['book_id']}/publication-plans",
         headers=headers,
@@ -236,7 +249,7 @@ def test_blocked_plan_item_resume_api(tmp_path: Path):
     client = TestClient(create_app(cfg, db))
     response = client.post(
         "/api/v1/publication-plans/resume-api/items/6/resume",
-        headers={"X-Ainovel-Token": "secret"},
+        headers=AUTH_HEADERS,
         json={
             "text_sha256": "6" * 64,
             "acknowledgement": "platform_checked_no_submission",
@@ -271,7 +284,7 @@ def test_recover_unsubmitted_chapter_api_uses_checkpoint_and_absence_evidence(tm
         "plan_id": "api-recovery", "error": "automation_blocked",
     })
     client = TestClient(create_app(cfg, db))
-    headers = {"X-Ainovel-Token": "secret"}
+    headers = AUTH_HEADERS
 
     chapter = client.get(f"/api/v1/books/{row['book_id']}/chapters/8", headers=headers).json()
     assert chapter["recovery"]["allowed"] is True

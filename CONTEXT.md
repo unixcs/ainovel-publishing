@@ -113,8 +113,8 @@ Explicitly reopening a recoverable publication interruption only after checking 
 _Avoid_: Retry button, blind restart
 
 **Platform Absence Observation**:
-Current evidence from the target work's chapter-management list that one chapter number has no draft, scheduled, reviewing, or published row. It authorizes recovery only for a run that never crossed the final submission boundary.
-_Avoid_: Empty cache, missing local row
+Current evidence from a fully actionable, stable target-work chapter-management list that one chapter number has no draft, scheduled, reviewing, or published row. A transient empty or still-loading page never qualifies, and the observation authorizes recovery only before the final submission boundary.
+_Avoid_: Empty cache, loading-page result, missing local row
 
 **Reconciliation**:
 The comparison of the source manifest, local ledger, and Fanqie chapter/draft/schedule state before creating or changing a platform submission.

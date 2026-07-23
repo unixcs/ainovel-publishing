@@ -45,7 +45,7 @@ def test_simplified_sidepanel_renders_user_labels_without_internal_block_codes()
               sendMessage(payload, callback) {
                 const responses = {
                   getSettings: {baseUrl:'http://127.0.0.1:8787',apiToken:'token',selectedSlot:'20:00',aiPolicy:'remember',automationEnabled:false},
-                  health: {ok:true,version:'0.3.2'},
+                  health: {ok:true,version:'0.3.3'},
                   getPublicationSettings: {daily_limit:9999,slots:['12:00','20:00','22:00'],default_slot:'20:00'},
                   getBooks: {books:[{book_id:'book',name:'示例小说',ready_count:1}]},
                   getChapters: {chapters:[{book_id:'book',chapter_no:6,title:'第六章 夜话',status:'filled',platform_state:null,version:1,char_count:3965,text_sha256:'aaaaaaaaaaaaaaa'}]},
@@ -59,8 +59,14 @@ def test_simplified_sidepanel_renders_user_labels_without_internal_block_codes()
         page.goto((ROOT / "sidepanel.html").as_uri())
         page.wait_for_function("document.querySelector('#connectionBadge')?.textContent === '已连接'")
         assert errors == []
-        assert page.locator("#inspectPlatform").inner_text() == "刷新番茄状态"
-        assert page.locator("#smartRunNext").inner_text() == "自动处理下一章"
+        assert page.locator("#inspectPlatform").text_content() == "仅重新读取平台状态（不发布）"
+        assert page.locator("#smartRunNext").inner_text() == "检查并处理下一章"
+        assert page.locator("#createPlan").count() == 0
+        assert page.locator("#approvePlan").count() == 0
+        assert page.locator("#runNext").count() == 0
+        assert "更新排程" not in page.locator("body").inner_text()
+        assert "批准排程" not in page.locator("body").inner_text()
+        assert "执行下一章" not in page.locator("body").inner_text()
         assert page.locator(".advanced-panel").first.get_attribute("open") is None
         assert page.locator("#planList").is_visible() is False
         page.locator(".advanced-panel").first.locator("summary").click()
@@ -94,7 +100,7 @@ def test_recoverable_blocked_chapter_has_one_clickable_primary_recovery_action()
               sendMessage(payload, callback) {
                 const responses = {
                   getSettings: {baseUrl:'http://127.0.0.1:8787',apiToken:'token',selectedSlot:'20:00',aiPolicy:'remember',automationEnabled:false},
-                  health: {ok:true,version:'0.3.2'},
+                  health: {ok:true,version:'0.3.3'},
                   getPublicationSettings: {daily_limit:9999,slots:['12:00','20:00','22:00'],default_slot:'20:00'},
                   getBooks: {books:[{book_id:'book',name:'示例小说',ready_count:0}]},
                   getChapters: {chapters:[CHAPTER]},
@@ -113,8 +119,8 @@ def test_recoverable_blocked_chapter_has_one_clickable_primary_recovery_action()
         assert errors == []
         assert page.locator("#smartChapterAction").inner_text() == "恢复并重新处理本章"
         assert page.locator("#smartChapterAction").is_enabled()
-        assert page.locator("#fillChapter").is_disabled()
-        assert page.locator("#resumeBlocked").is_enabled()
+        assert page.locator("#fillChapter").count() == 0
+        assert page.locator("#resumeBlocked").count() == 0
         browser.close()
 
 
@@ -162,7 +168,7 @@ def test_background_canonical_navigation_binds_dynamic_work_and_reuses_preflight
                 },
                 async reload(id) {
                   const tab=window.__tabs.find(item => item.id === Number(id)); tab.status='complete';
-                  window.__adapterVersion='0.3.2'; window.__reloadCount += 1;
+                  window.__adapterVersion='0.3.3'; window.__reloadCount += 1;
                 },
                 async create(changes) { const tab={id:99,status:'complete',...changes}; window.__tabs.push(tab); return {...tab}; },
                 async sendMessage(_id, message) {
@@ -202,3 +208,69 @@ def test_main_button_no_longer_requires_user_to_open_writer_page_first():
     assert "inspectPlatform()" in block
     assert "inspectActivePage" not in block
     assert "请先打开章节管理页" not in block
+
+
+def test_pre_mutation_new_chapter_failure_stays_retryable_instead_of_becoming_blocked():
+    source = (ROOT / "background.js").read_text(encoding="utf-8")
+    start = source.index("async function automateChapter(")
+    end = source.index("async function continueManualAi(")
+    block = source[start:end]
+    assert "pageMutationStarted = Boolean(opened?.mutationAttempted);" in block
+    assert "if (activeChapter && pageMutationStarted)" in block
+    assert '"failed"' in block
+    assert block.index("pageMutationStarted = Boolean(opened?.mutationAttempted);") < block.index("if (activeChapter && pageMutationStarted)")
+
+
+def test_platform_absence_is_accepted_only_from_stable_ready_list():
+    source = (ROOT / "background.js").read_text(encoding="utf-8")
+    start = source.index("async function inspectPlatform(")
+    end = source.index("async function getChapter(", start)
+    block = source[start:end]
+    assert "!snapshot.listStable || !snapshot.newChapterReady" in block
+    assert "rememberPlatformPreflight" in block
+    assert block.index("!snapshot.listStable || !snapshot.newChapterReady") < block.index("rememberPlatformPreflight")
+
+
+def test_automation_failure_reloads_plan_state_before_showing_original_error():
+    source = (ROOT / "sidepanel.js").read_text(encoding="utf-8")
+    start = source.index("async function runAutomation(")
+    end = source.index("async function reconcileSelected(")
+    block = source[start:end]
+    assert "const originalError = response.error" in block
+    assert "await connectAndLoad();" in block
+    assert block.index("await connectAndLoad();") < block.index("自动发布已停止：${originalError}")
+
+
+def test_recovering_multiple_false_blocks_preserves_the_original_next_chapter_target():
+    source = (ROOT / "sidepanel.js").read_text(encoding="utf-8")
+    assert "targetChapterNo: chapterNo" in source
+    start = source.index("async function recoverBlockedChapter(")
+    end = source.index("async function runAutomation(", start)
+    block = source[start:end]
+    assert "targetChapterNo = chapterNo" in block
+    assert "if (rerun) await prepareAndRun(targetChapterNo);" in block
+    assert "if (rerun) await prepareAndRun(chapterNo);" not in block
+
+
+def test_every_new_chapter_path_requires_stable_preflight_even_without_sidepanel_refresh():
+    source = (ROOT / "background.js").read_text(encoding="utf-8")
+    automate_start = source.index("async function automateChapter(")
+    automate_end = source.index("async function continueManualAi(")
+    automate = source[automate_start:automate_end]
+    assert "stableAutomationPreflightTab(bookId, expectedWorkId, chapterNo)" in automate
+    helper_start = source.index("async function stableAutomationPreflightTab(")
+    helper_end = source.index("async function rememberPlatformPreflight(", helper_start)
+    helper = source[helper_start:helper_end]
+    assert 'type: "inspectPublicationList"' in helper
+    assert "recentPlatformPreflightTab(bookId, expectedWorkId, chapterNo)" in helper
+    assert "!snapshot?.ok || !snapshot.listStable || !snapshot.newChapterReady" in helper
+    assert "row.found" in helper
+
+
+def test_extension_sends_exact_bundle_version_on_every_local_api_request():
+    source = (ROOT / "background.js").read_text(encoding="utf-8")
+    start = source.index("async function apiRequest(")
+    end = source.index("async function fillChapter(", start)
+    block = source[start:end]
+    assert '"X-Ainovel-Client-Version": PAGE_ADAPTER_VERSION' in block
+    assert 'headers["X-Ainovel-Token"] = apiToken' in block

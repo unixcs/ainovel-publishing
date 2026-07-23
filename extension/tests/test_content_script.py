@@ -257,7 +257,7 @@ def test_publication_list_extracts_schedule_evidence():
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
         page = browser.new_page()
         page.set_content("""
-        <main><h1>章节管理</h1><div>第 6 章  来客　定时发布 2026-07-23 20:00</div>
+        <main><h1>章节管理</h1><button>新建章节</button><div>第 6 章  来客　定时发布 2026-07-23 20:00</div>
         <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script></main>
         """)
         page.add_script_tag(path=str(SCRIPT))
@@ -275,7 +275,7 @@ def test_publication_list_does_not_borrow_adjacent_chapter_date():
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
         page = browser.new_page()
         page.set_content("""
-        <main><h1>章节管理</h1>
+        <main><h1>章节管理</h1><button>新建章节</button>
           <div class="chapter-row">第 6 章 来客 草稿</div>
           <div class="chapter-row">第 7 章 同行 定时发布 2026-07-25 20:00</div>
           <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
@@ -329,7 +329,7 @@ def test_realistic_chapter_table_keeps_reviewing_row_isolated_from_published_nei
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
         page = browser.new_page()
         page.set_content("""
-        <main><h1>章节管理</h1>
+        <main><h1>章节管理</h1><button>新建章节</button>
           <div class="chapter-table">
             <div class="data-row"><span>第6章 夜话</span><span>-</span><span>0</span><span>审核中</span><span>2026-07-24 07:10</span></div>
             <div class="data-row"><span>第5章 来客</span><span>7712</span><span>0</span><span>待发布</span><span>2026-07-23 07:10</span></div>
@@ -351,6 +351,164 @@ def test_realistic_chapter_table_keeps_reviewing_row_isolated_from_published_nei
         assert rows[5]["scheduled"] is True
         assert rows[5]["published"] is False
         assert rows[4]["published"] is True
+        browser.close()
+
+
+def test_publication_list_waits_for_async_rows_and_returns_only_stable_snapshot():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <main><h1>章节管理</h1><div id="toolbar"></div><div id="rows"></div></main>
+        <script>
+          window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};
+          setTimeout(() => { document.getElementById('toolbar').innerHTML = '<button>新建章节</button>'; }, 180);
+          setTimeout(() => { document.getElementById('rows').innerHTML = '<div class="chapter-row">第 8 章 兽潮 草稿</div>'; }, 2000);
+        </script>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "inspectPublicationList", "chapterNos": [8, 9]})
+        rows = {row["chapterNo"]: row for row in result["rows"]}
+        assert result["ok"] is True
+        assert result["listStable"] is True
+        assert result["newChapterReady"] is True
+        assert rows[8]["found"] is True
+        assert rows[8]["draft"] is True
+        assert rows[9]["found"] is False
+        browser.close()
+
+
+def test_header_only_page_is_never_accepted_as_all_chapters_absent():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <main><h1>章节管理</h1><div>页面外壳已出现，列表仍未挂载</div></main>
+        <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "inspectPublicationList", "chapterNos": [8], "timeoutMs": 100})
+        assert result["ok"] is False
+        assert result["listStable"] is False
+        assert result["newChapterReady"] is False
+        assert result["code"] == "publication_list_not_ready"
+        browser.close()
+
+
+def test_toolbar_without_list_data_is_not_accepted_as_empty_platform_list():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <main><h1>章节管理</h1><button>新建章节</button><div>列表数据仍未挂载</div></main>
+        <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "inspectPublicationList", "chapterNos": [8], "timeoutMs": 100})
+        assert result["ok"] is False
+        assert result["listStable"] is False
+        assert result["newChapterReady"] is True
+        assert result["listContentReady"] is False
+        assert result["code"] == "publication_list_content_not_ready"
+        browser.close()
+
+
+def test_explicit_empty_list_can_be_stably_verified_for_a_new_work():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <main><h1>章节管理</h1><button>新建章节</button><div class="empty-state">暂无章节</div></main>
+        <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "inspectPublicationList", "chapterNos": [1], "timeoutMs": 4000})
+        assert result["ok"] is True
+        assert result["listStable"] is True
+        assert result["listContentReady"] is True
+        assert result["emptyList"] is True
+        assert result["rows"][0]["found"] is False
+        browser.close()
+
+
+def test_open_new_chapter_waits_for_async_semantic_button_and_clicks_once():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <main><h1>章节管理</h1><div id="toolbar"></div></main>
+        <script>
+          window.__clicks = 0;
+          window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};
+          setTimeout(() => {
+            const button = document.createElement('button');
+            button.textContent = '新建章节';
+            button.onclick = () => { window.__clicks += 1; };
+            document.getElementById('toolbar').appendChild(button);
+          }, 350);
+        </script>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "openNewChapter", "timeoutMs": 2000})
+        assert result["ok"] is True
+        assert result["mutationAttempted"] is True
+        assert page.evaluate("window.__clicks") == 1
+        browser.close()
+
+
+def test_open_new_chapter_accepts_exact_text_in_small_custom_clickable_div():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <main><h1>章节管理</h1>
+          <div id="custom" class="create-action" style="width:120px;height:36px;cursor:pointer" onclick="window.__clicks += 1">
+            <span>新建章节</span>
+          </div>
+        </main>
+        <script>window.__clicks=0;window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "openNewChapter", "timeoutMs": 100})
+        assert result["ok"] is True
+        assert result["selected"]["id"] == "custom"
+        assert page.evaluate("window.__clicks") == 1
+        browser.close()
+
+
+def test_new_chapter_finder_rejects_large_container_that_only_contains_phrase():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width": 1280, "height": 720})
+        page.set_content("""
+        <main><h1>章节管理</h1>
+          <div id="large" style="width:1000px;height:300px;cursor:pointer" onclick="window.__clicks += 1">
+            <span>新建章节</span>
+          </div>
+        </main>
+        <script>window.__clicks=0;window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = page.evaluate("() => ({found: Boolean(findNewChapterControl().element), snapshot: readPublicationListSnapshot([8])})")
+        assert result["found"] is False
+        assert result["snapshot"]["newChapterReady"] is False
+        assert page.evaluate("window.__clicks") == 0
+        browser.close()
+
+
+def test_missing_new_chapter_reports_no_page_mutation():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <main><h1>章节管理</h1><p>按钮尚未加载</p></main>
+        <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "openNewChapter", "timeoutMs": 100})
+        assert result["ok"] is False
+        assert result["code"] == "new_chapter_button_missing"
+        assert result["mutationAttempted"] is False
         browser.close()
 
 

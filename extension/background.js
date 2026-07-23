@@ -13,9 +13,9 @@ const DEFAULT_SETTINGS = {
 const TARGET_ROOT_HOST = "fanqienovel.com";
 const BOOK_MANAGE_URL = "https://fanqienovel.com/main/writer/book-manage";
 const AUTOMATION_ALARM = "ainovel-publication-runner";
-const AUTOMATION_SAFETY_EPOCH = "0.3.2-canonical-preflight-strict-next";
-const PLATFORM_PREFLIGHT_TTL_MS = 10 * 60 * 1000;
-const PAGE_ADAPTER_VERSION = "0.3.2";
+const AUTOMATION_SAFETY_EPOCH = "0.3.3-stable-list-new-chapter-boundary";
+const PLATFORM_PREFLIGHT_TTL_MS = 2 * 60 * 1000;
+const PAGE_ADAPTER_VERSION = "0.3.3";
 let automationLock = false;
 const safetyReady = enforceAutomationSafetyEpoch();
 
@@ -168,7 +168,10 @@ async function ensureAutomationAlarm() {
 async function apiRequest(path, options = {}) {
   const { baseUrl, apiToken } = await chrome.storage.local.get(DEFAULT_SETTINGS);
   if (options.authenticated !== false && !apiToken) throw new Error("请先填写本地助手 API Token。");
-  const headers = { "Content-Type": "application/json" };
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Ainovel-Client-Version": PAGE_ADAPTER_VERSION
+  };
   if (options.authenticated !== false) headers["X-Ainovel-Token"] = apiToken;
   const response = await fetch(`${baseUrl}${path}`, {
     method: options.method || "GET",
@@ -262,17 +265,17 @@ async function automateChapter(bookId, chapterNo, planId) {
 
     const tab = resumeCurrentEditor
       ? await findMatchingEditorTab(chapter, expectedWorkId)
-      : (await recentPlatformPreflightTab(bookId, expectedWorkId)) || await ensureChapterManagementTab(expectedWorkId);
+      : await stableAutomationPreflightTab(bookId, expectedWorkId, chapterNo);
     const identity = { bookName: expectedWorkId ? null : expectedBook.name, workId: expectedWorkId };
     const page = await sendPageAction(tab.id, { type: "inspectPage", ...identity });
-    if (!page?.ok || page.state === "login_required") {
+    if (page?.loginRequired || page?.state === "login_required") {
       throw automationFailure("番茄登录状态无效，请先在 Edge 中登录后再继续。", "login_required", page);
+    }
+    if (!page?.ok || page.state === "unknown") {
+      throw automationFailure("番茄页面仍在加载或无法识别，页面未被操作。请直接重试主按钮。", "unknown_page_state", page);
     }
     if (!page.workMatches) {
       throw automationFailure("当前番茄页面无法确认目标作品，已停止。", "work_identity_mismatch", page);
-    }
-    if (page.state === "unknown") {
-      throw automationFailure("无法识别当前番茄页面，已停止。", "unknown_page_state", page);
     }
 
     let editorTab = tab;
@@ -294,13 +297,17 @@ async function automateChapter(bookId, chapterNo, planId) {
       }
     } else if (page.state !== "editor") {
       const beforeIds = new Set((await chrome.tabs.query({ currentWindow: true })).map((entry) => entry.id));
-      // Clicking “new chapter” may create a draft even if the following response is lost.
+      // A lost response after the click must remain fail-closed. However, when the page
+      // adapter explicitly reports mutationAttempted:false (for example the SPA button
+      // never mounted), nothing on Fanqie changed and the chapter must stay retryable.
       pageMutationStarted = true;
       const opened = await sendPageAction(tab.id, { type: "openNewChapter", ...identity });
       await clearPlatformPreflight(bookId);
       if (!opened?.ok) {
+        pageMutationStarted = Boolean(opened?.mutationAttempted);
         throw automationFailure(opened?.error || "打开新建章节失败。", opened?.code || "new_chapter_failed", opened);
       }
+      pageMutationStarted = true;
       editorTab = await waitForEditorTab(beforeIds, 20_000, expectedWorkId);
     }
 
@@ -685,13 +692,14 @@ async function waitForPageScript(tabId, timeoutMs) {
     }
     await sleep(300);
   }
-  throw automationFailure("番茄页面已打开，但 0.3.2 页面适配器没有加载完成。请在扩展管理页重新加载插件。", "content_script_unavailable");
+  throw automationFailure(`番茄页面已打开，但 ${PAGE_ADAPTER_VERSION} 页面适配器没有加载完成。请在扩展管理页重新加载插件。`, "content_script_unavailable");
 }
 
-async function recentPlatformPreflightTab(bookId, expectedWorkId) {
+async function recentPlatformPreflightTab(bookId, expectedWorkId, chapterNo = null) {
   const stored = await chrome.storage.local.get({ platformPreflightByBook: {} });
   const preflight = stored.platformPreflightByBook?.[bookId];
   if (!preflight || preflight.workId !== String(expectedWorkId)) return null;
+  if (chapterNo !== null && !(preflight.chapterNos || []).map(Number).includes(Number(chapterNo))) return null;
   if (Date.now() - Number(preflight.checkedAt || 0) > PLATFORM_PREFLIGHT_TTL_MS) return null;
   try {
     const tab = await chrome.tabs.get(Number(preflight.tabId));
@@ -700,6 +708,42 @@ async function recentPlatformPreflightTab(bookId, expectedWorkId) {
   } catch (_error) {
     return null;
   }
+}
+
+async function stableAutomationPreflightTab(bookId, expectedWorkId, chapterNo) {
+  const recent = await recentPlatformPreflightTab(bookId, expectedWorkId, chapterNo);
+  if (recent) return recent;
+
+  // Background execution and direct chapter actions may not have a side-panel refresh.
+  // They still need the same stable absence evidence immediately before creating a
+  // chapter; a document-ready shell is not sufficient for a Fanqie SPA.
+  const tab = await ensureChapterManagementTab(expectedWorkId);
+  const snapshot = await sendPageAction(tab.id, {
+    type: "inspectPublicationList",
+    chapterNos: [Number(chapterNo)]
+  });
+  if (!snapshot?.ok || !snapshot.listStable || !snapshot.newChapterReady) {
+    throw automationFailure(
+      snapshot?.error || "章节管理页尚未稳定加载，页面未被操作。请直接重试主按钮。",
+      snapshot?.code || "publication_list_unstable",
+      snapshot
+    );
+  }
+  if (snapshot.workId !== String(expectedWorkId)) {
+    throw automationFailure("章节管理页不是已绑定的目标作品，已停止。", "work_identity_mismatch", {
+      expectedWorkId, snapshot
+    });
+  }
+  const existing = (snapshot.rows || []).find((row) => Number(row.chapterNo) === Number(chapterNo) && row.found);
+  if (existing) {
+    throw automationFailure(
+      `番茄平台已经存在第 ${chapterNo} 章记录，拒绝重复新建。请用主按钮刷新并对账。`,
+      "platform_record_requires_reconciliation",
+      { snapshot, existing }
+    );
+  }
+  await rememberPlatformPreflight(bookId, expectedWorkId, tab, snapshot);
+  return tab;
 }
 
 async function rememberPlatformPreflight(bookId, workId, tab, snapshot) {
@@ -711,7 +755,8 @@ async function rememberPlatformPreflight(bookId, workId, tab, snapshot) {
         workId: String(workId),
         tabId: tab.id,
         checkedAt: Date.now(),
-        url: snapshot?.url || tab.url
+        url: snapshot?.url || tab.url,
+        chapterNos: (snapshot?.rows || []).map((row) => Number(row.chapterNo))
       }
     }
   });
@@ -816,6 +861,13 @@ async function inspectPlatform(bookId, chapterNos) {
   const tab = await ensureChapterManagementTab(expectedWorkId);
   const snapshot = await sendPageAction(tab.id, { type: "inspectPublicationList", chapterNos });
   if (!snapshot?.ok) throw automationFailure(snapshot?.error || "读取平台章节列表失败。", snapshot?.code || "publication_list_unrecognized", snapshot);
+  if (!snapshot.listStable || !snapshot.newChapterReady) {
+    throw automationFailure(
+      "章节管理页尚未稳定加载，本次结果不会用于判断章节不存在。请直接重试主按钮。",
+      "publication_list_unstable",
+      snapshot
+    );
+  }
   if (snapshot.workId !== String(expectedWorkId)) {
     throw automationFailure("章节管理页不是已绑定的目标作品，已停止。", "work_identity_mismatch", { expectedWorkId, snapshot });
   }

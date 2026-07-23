@@ -10,19 +10,20 @@
   <header>
     <div>
       <h1>Ainovel 发布助手</h1>
-      <p>刷新一次平台状态，然后只需选择章节并点击“处理本章”。</p>
+      <p>登录番茄后，只需点击一次“检查并处理下一章”。</p>
     </div>
     <span id="connectionBadge" class="badge neutral">未连接</span>
   </header>
 
-  <details class="panel" id="settingsPanel" open>
-    <summary>本地助手与发布策略</summary>
+  <details class="panel" id="settingsPanel">
+    <summary>设置（首次使用或修改发布时间时打开）</summary>
     <label>接口地址<input id="baseUrl" value="http://127.0.0.1:8787"></label>
     <label>API Token<input id="apiToken" type="password" autocomplete="off"></label>
     <div class="settings-grid">
       <label>每日安全上限（字）<input id="dailyLimit" type="number" min="1" max="9999" value="9999"></label>
       <label>默认发布时间<select id="publicationSlot"><option value="12:00">每天 12:00</option><option value="20:00" selected>每天 20:00</option><option value="22:00">每天 22:00</option></select></label>
     </div>
+    <label>最早排程日期<input id="planStartDate" type="date"></label>
     <label>AI 声明策略
       <select id="aiPolicy">
         <option value="remember" selected>按作品记住上次明确选择（推荐）</option>
@@ -63,24 +64,13 @@
 
   <section class="panel plan-panel">
     <div class="section-title"><h2>发布控制台</h2><span id="planBadge" class="badge neutral">尚未排程</span></div>
-    <div class="row primary-actions">
-      <button id="inspectPlatform" class="secondary">刷新番茄状态</button>
-      <button id="smartRunNext">自动处理下一章</button>
-    </div>
-    <div id="platformSummary" class="platform-summary neutral">先在番茄章节管理页刷新一次状态。</div>
-    <p class="safe-note">这里显示的是番茄平台已有章节，不是本地小说总章数。平台已有内容不会重复提交。</p>
+    <button id="smartRunNext" class="main-action">检查并处理下一章</button>
+    <p class="safe-note">插件会等待页面加载稳定，再核对、排程并处理；平台已有章节绝不重复提交。</p>
 
     <details class="advanced-panel">
-      <summary>高级：查看和手动调整排程</summary>
-      <div class="settings-grid">
-        <label>计划起始日期<input id="planStartDate" type="date"></label>
-        <label>计划说明<input id="planSummary" readonly value="自动避开平台已有章节"></label>
-      </div>
-      <div class="row wrap">
-        <button id="createPlan">更新排程</button>
-        <button id="approvePlan" class="secondary" disabled>批准排程</button>
-        <button id="runNext" disabled>执行下一章</button>
-      </div>
+      <summary>查看平台状态与排程（只读）</summary>
+      <button id="inspectPlatform" class="secondary read-only-action">仅重新读取平台状态（不发布）</button>
+      <div id="platformSummary" class="platform-summary neutral">尚未读取番茄章节列表。</div>
       <div id="planList" class="plan-list">尚未生成发布排程。</div>
     </details>
   </section>
@@ -96,13 +86,6 @@
       <pre id="previewBody"></pre>
       <button id="smartChapterAction" disabled>处理本章</button>
       <div id="actionResult" class="action-result neutral">选择一章后，插件会告诉你唯一需要做的下一步。</div>
-      <details class="advanced-panel chapter-tools">
-        <summary>高级：单步工具</summary>
-        <button id="reconcileChapter" class="secondary" disabled>核对当前番茄章节</button>
-        <button id="fillChapter" class="secondary" disabled>只填充，不提交</button>
-        <button id="autoPublishChapter" class="secondary" disabled>按已有排程发布</button>
-        <button id="resumeBlocked" class="secondary" disabled>确认未提交并恢复本章</button>
-      </details>
       <p class="warning">验证码、风控、内容冲突或未知页面仍会停止，不会绕过安全检查。</p>
     </section>
   </main>

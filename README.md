@@ -9,7 +9,7 @@ The system separates four responsibilities because they have different trust and
 1. **Server exporter** — turns canonical completed Markdown chapters into deterministic release artifacts and a SHA256 manifest.
 2. **Windows companion** — owns SSH/SFTP access, local chapter cache, SQLite publishing ledger, quota-aware publication plans, and the authenticated localhost API.
 3. **Browser extension** — owns the local logged-in Edge session, page/state recognition, editor interaction, publication settings, and read-back verification.
-4. **Human operator** — chooses the chapter/action, handles login/CAPTCHA/risk-control or unknown states, and resolves real version conflicts. The primary action creates and approves a conflict-free plan automatically; advanced manual controls remain available.
+4. **Human operator** — starts the single primary action, handles login/CAPTCHA/risk-control or unknown states, and resolves real version conflicts. Planning and approval are internal workflow steps rather than separate UI buttons.
 
 ```text
 Ainovel source chapters
@@ -26,7 +26,7 @@ Ainovel source chapters
 
 ## Current status
 
-Version `0.3.2` makes the live path deterministic: refresh opens the bound work's canonical chapter-management URL and records a short-lived preflight; the next action reuses that context instead of bouncing through Fanqie pages. The editor adapter clicks only the bottom-most exact, enabled `button`/`role=button` labelled “下一步”, never a containing `div`, and persists URL/editor/dialog/button diagnostics for any unknown transition. The final-submit checkpoint remains fail-closed, and background automatic execution stays **off** until a live platform read-back succeeds. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for rollout and [`docs/plan-boundaries.md`](docs/plan-boundaries.md) for the confirmed boundaries.
+Version `0.3.3` reduces the daily path to one primary action: **检查并处理下一章**. It waits for Fanqie's SPA to expose a real chapter row (or explicit empty-list state), the “新建章节” control, and a stable whole-list signature before using absence as evidence, waits for the reversible new-chapter navigation control in the same run, and distinguishes an explicit no-click failure from a real page mutation so transient loading cannot lock a chapter. Stale plan controls were removed, failures reload ledger state immediately, and recovery of multiple old false blocks preserves the earliest target chapter. Strict “下一步”, final-submit, version, quota, and read-back boundaries remain fail-closed; background automatic execution stays **off** until a live platform read-back succeeds. The companion also rejects authenticated requests from a missing or mismatched extension bundle version, fencing an old Edge service worker before it can fetch a plan or touch Fanqie. See [`docs/implementation-plan.md`](docs/implementation-plan.md) and [`extension/README.md`](extension/README.md).
 
 ## Repository layout
 
@@ -57,7 +57,7 @@ See [`companion/README.md`](companion/README.md). Initialize it, edit the genera
 
 ### 3. Load the extension
 
-See [`extension/README.md`](extension/README.md). Load `extension/` as an unpacked extension in Edge or Chrome, enter the localhost API token, refresh the platform chapter list, use the primary action for one live chapter, and keep background automatic execution off until that run passes.
+See [`extension/README.md`](extension/README.md). Load `extension/` as an unpacked extension in Edge or Chrome, enter the localhost API token, log in to Fanqie, and click **检查并处理下一章**. No separate refresh, plan update, approval, or execution step is required.
 
 ## Safety boundaries
 

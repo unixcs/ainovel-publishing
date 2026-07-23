@@ -77,12 +77,23 @@ def create_app(config: AppConfig, db: PublishingDB, synchronizer: RemoteSynchron
         allow_origins=["*"],
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "X-Ainovel-Token"],
+        allow_headers=["Content-Type", "X-Ainovel-Token", "X-Ainovel-Client-Version"],
     )
 
-    def require_token(x_ainovel_token: str | None = Header(default=None)) -> None:
+    def require_token(
+        x_ainovel_token: str | None = Header(default=None),
+        x_ainovel_client_version: str | None = Header(default=None),
+    ) -> None:
         if not x_ainovel_token or x_ainovel_token != config.api.token:
             raise HTTPException(status_code=401, detail="invalid_local_api_token")
+        # An unpacked Edge extension keeps its old service worker alive until Reload.
+        # Fence every authenticated read at the API boundary so a stale background
+        # cannot fetch a plan and mutate Fanqie before its first event write.
+        if x_ainovel_client_version != __version__:
+            raise HTTPException(
+                status_code=409,
+                detail=f"stale_extension_version:expected={__version__}",
+            )
 
     publication = config.publication
     timezone_name = publication.timezone if publication else DEFAULT_TIMEZONE
@@ -93,7 +104,12 @@ def create_app(config: AppConfig, db: PublishingDB, synchronizer: RemoteSynchron
 
     @app.get("/api/v1/health")
     def health() -> dict[str, Any]:
-        return {"ok": True, "version": __version__, "service": "ainovel-publisher-companion"}
+        return {
+            "ok": True,
+            "version": __version__,
+            "required_client_version": __version__,
+            "service": "ainovel-publisher-companion",
+        }
 
     @app.get("/api/v1/settings/publication", dependencies=[Depends(require_token)])
     def publication_settings() -> dict[str, Any]:

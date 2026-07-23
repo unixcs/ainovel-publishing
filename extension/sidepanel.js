@@ -27,16 +27,9 @@ function bindEvents() {
   $("refreshList").addEventListener("click", loadChapters);
   $("bookSelect").addEventListener("change", async () => { await loadChapters(); await loadPlans(); });
   $("statusFilter").addEventListener("change", loadChapters);
-  $("fillChapter").addEventListener("click", fillSelected);
-  $("autoPublishChapter").addEventListener("click", autoPublishSelected);
-  $("reconcileChapter").addEventListener("click", reconcileSelected);
   $("inspectPlatform").addEventListener("click", inspectPlatform);
   $("smartRunNext").addEventListener("click", smartRunNext);
   $("smartChapterAction").addEventListener("click", smartProcessSelected);
-  $("createPlan").addEventListener("click", createPlan);
-  $("approvePlan").addEventListener("click", approvePlan);
-  $("runNext").addEventListener("click", runNext);
-  $("resumeBlocked").addEventListener("click", resumeBlockedSelected);
 }
 
 async function saveSettings() {
@@ -76,7 +69,12 @@ async function connectAndLoad() {
     }
   }
   const books = await send({ type: "getBooks" });
-  if (!books.ok) return setStatus("认证失败", books.error, "danger");
+  if (!books.ok) {
+    if (String(books.error || "").includes("stale_extension_version")) {
+      return setStatus("插件版本未生效", "请到 edge://extensions 对本插件点一次“重新加载”，旧后台已被安全阻止。", "danger");
+    }
+    return setStatus("认证失败", books.error, "danger");
+  }
   state.books = books.result.books || [];
   renderBooks();
   await loadChapters();
@@ -160,10 +158,6 @@ function renderPreview(chapter) {
     $("previewBody").textContent = "";
     $("smartChapterAction").disabled = true;
     $("smartChapterAction").textContent = "处理本章";
-    $("fillChapter").disabled = true;
-    $("autoPublishChapter").disabled = true;
-    $("reconcileChapter").disabled = true;
-    $("resumeBlocked").disabled = true;
     return;
   }
   $("previewTitle").textContent = `第 ${chapter.chapter_no} 章 · ${chapter.title}`;
@@ -174,23 +168,7 @@ function renderPreview(chapter) {
   const primary = primaryActionForChapter(chapter);
   $("smartChapterAction").textContent = primary.label;
   $("smartChapterAction").disabled = primary.disabled;
-  $("fillChapter").disabled = !["ready", "synced", "planned", "fill_started", "filled"].includes(chapter.status);
-  $("reconcileChapter").textContent = ["scheduled_unverified", "published_unverified"].includes(chapter.platform_state)
-    ? "核对当前番茄章节正文"
-    : "对账当前番茄草稿";
-  $("reconcileChapter").disabled = !(
-    chapter.status === "legacy_draft" ||
-    ["scheduled_unverified", "published_unverified", "draft_unverified"].includes(chapter.platform_state)
-  );
-  const item = currentPlanItem(chapter.chapter_no);
-  const waitingForAi = item?.status === "awaiting_ai_choice";
-  $("autoPublishChapter").textContent = waitingForAi
-    ? "我已手动选择 AI，继续发布"
-    : "按当前计划自动定时发布";
-  $("autoPublishChapter").disabled = !(
-    state.currentPlan?.status === "approved" && ["planned", "awaiting_ai_choice"].includes(item?.status)
-  );
-  $("resumeBlocked").disabled = !(chapter.status === "blocked" && chapter.recovery?.allowed);
+
 }
 
 function renderPlan() {
@@ -200,13 +178,11 @@ function renderPlan() {
     $("planBadge").textContent = "尚未排程";
     $("planBadge").className = "badge neutral";
     list.textContent = "尚未生成发布排程。";
-    $("approvePlan").disabled = true;
-    $("runNext").disabled = true;
     return;
   }
-  $("planBadge").textContent = planStatusLabel(plan.status);
-  $("planBadge").className = `badge ${plan.status === "approved" ? "ok" : plan.status === "draft" ? "warn" : "danger"}`;
-  const blocked = (plan.items || []).filter((item) => item.status === "blocked");
+  const hasBlockedItem = (plan.items || []).some((item) => item.status === "blocked");
+  $("planBadge").textContent = hasBlockedItem ? "待自动处理" : planStatusLabel(plan.status);
+  $("planBadge").className = `badge ${hasBlockedItem ? "warn" : plan.status === "approved" ? "ok" : plan.status === "draft" ? "warn" : "danger"}`;
   list.innerHTML = `<div class="plan-meta">每日上限 ${plan.daily_limit} 字 · 默认 ${plan.default_slot} · ${aiPolicyLabel(plan.ai_policy)}</div>`;
   for (const item of plan.items || []) {
     const row = document.createElement("div");
@@ -217,8 +193,6 @@ function renderPlan() {
     if (item.reason) row.title = item.reason;
     list.appendChild(row);
   }
-  $("approvePlan").disabled = plan.status !== "draft" || blocked.length > 0;
-  $("runNext").disabled = plan.status !== "approved" || !(plan.items || []).some((item) => item.status === "planned");
   renderPreview(state.selected);
 }
 
@@ -312,10 +286,6 @@ async function requestPlan({ announce = true } = {}) {
   return response.result;
 }
 
-async function createPlan() {
-  await requestPlan({ announce: true });
-}
-
 async function smartRunNext() {
   const button = $("smartRunNext");
   button.disabled = true;
@@ -346,7 +316,7 @@ async function smartProcessSelected() {
     if (state.currentPlan?.status === "approved" && item?.status === "awaiting_ai_choice") {
       await runAutomation(item);
     } else {
-      setActionResult("请保留原来的番茄发布设置页，并从高级工具中的已有排程继续。", "warn");
+      setActionResult("原来的发布设置页或排程已经失效，已停止；请先核对番茄结果。", "warn");
     }
     return;
   }
@@ -377,8 +347,11 @@ async function prepareAndRun(chapterNo) {
   if (blocker) {
     const detail = await send({ type: "getChapter", bookId: $("bookSelect").value, chapterNo: blocker.chapter_no });
     if (detail.ok && detail.result?.recovery?.allowed) {
-      primaryButton.disabled = false;
-      await recoverBlockedChapter(blocker.chapter_no, { rerun: true, platformSnapshot: state.platformSnapshot });
+      await recoverBlockedChapter(blocker.chapter_no, {
+        rerun: true,
+        targetChapterNo: chapterNo,
+        platformSnapshot: state.platformSnapshot
+      });
       return;
     }
     const instruction = blockerInstruction(blocker);
@@ -419,35 +392,11 @@ async function prepareAndRun(chapterNo) {
   primaryButton.disabled = false;
 }
 
-async function approvePlan() {
-  if (!state.currentPlan) return;
-  const response = await send({ type: "approvePlan", planId: state.currentPlan.plan_id });
-  if (!response.ok) return setStatus("计划批准失败", response.error, "danger");
-  state.currentPlan = response.result;
-  renderPlan();
-  setStatus("计划已批准", "可以执行计划下一章，或打开自动执行开关等待本地 Edge 运行。", "ok");
-}
-
-async function runNext() {
-  if (!state.currentPlan) return;
-  const item = (state.currentPlan.items || []).find((entry) => entry.status === "planned");
-  if (!item) return setStatus("没有可执行章节", "当前计划没有 planned 项。", "warn");
-  await runAutomation(item);
-}
-
-async function autoPublishSelected() {
-  if (!state.selected) return;
-  const item = currentPlanItem(state.selected.chapter_no);
-  if (!item) return setActionResult("当前章节不在当前发布计划中。", "warn");
-  await runAutomation(item);
-}
-
-async function resumeBlockedSelected() {
-  if (!state.selected) return;
-  await recoverBlockedChapter(state.selected.chapter_no, { rerun: false });
-}
-
-async function recoverBlockedChapter(chapterNo, { rerun = false, platformSnapshot = null } = {}) {
+async function recoverBlockedChapter(chapterNo, {
+  rerun = false,
+  targetChapterNo = chapterNo,
+  platformSnapshot = null
+} = {}) {
   const bookId = $("bookSelect").value;
   const detail = await send({ type: "getChapter", bookId, chapterNo });
   if (!detail.ok) return setStatus("章节读取失败", detail.error, "danger");
@@ -474,7 +423,7 @@ async function recoverBlockedChapter(chapterNo, { rerun = false, platformSnapsho
     return setStatus("平台已有该章", "请打开这一章核对正文或定时状态。", "warn");
   }
 
-  // A click on “自动处理下一章” plus the fresh snapshot is already an explicit
+  // A click on the primary action plus the fresh snapshot is already an explicit
   // user-authorized retry. Do not ask the same question a second time. Advanced/manual
   // recovery still keeps the confirmation dialog when it did not inherit that snapshot.
   const explicitlyAuthorized = Boolean(rerun && platformSnapshot);
@@ -498,7 +447,7 @@ async function recoverBlockedChapter(chapterNo, { rerun = false, platformSnapsho
   setActionResult(`第 ${chapterNo} 章上次没有最终提交，已安全恢复。`, "ok");
   setStatus("已恢复本章", rerun ? "正在重新计算日期并继续处理。" : "可使用主按钮重新处理。", "ok");
   await connectAndLoad();
-  if (rerun) await prepareAndRun(chapterNo);
+  if (rerun) await prepareAndRun(targetChapterNo);
   return recovered.result;
 }
 
@@ -514,8 +463,10 @@ async function runAutomation(item) {
     planId: state.currentPlan.plan_id
   });
   if (!response.ok) {
-    setActionResult(`自动发布已停止：${response.error}`, "danger");
-    return setStatus("自动发布已阻塞", response.error, "danger");
+    const originalError = response.error;
+    await connectAndLoad();
+    setActionResult(`自动发布已停止：${originalError}`, "danger");
+    return setStatus("自动发布已停止", "状态已经重新读取；若页面没有被操作，可直接重试主按钮。", "danger");
   }
   if (response.result?.paused) {
     $("statusFilter").value = "awaiting_ai_choice";
@@ -531,11 +482,12 @@ async function runAutomation(item) {
 
 async function reconcileSelected() {
   if (!state.selected) return;
-  const button = $("reconcileChapter");
-  button.disabled = true;
   setStatus("正在核对当前番茄章节…", "只读取并比较章节号、标题和正文，不会覆盖番茄内容。", "neutral");
   const response = await send({ type: "reconcileChapter", bookId: state.selected.book_id, chapterNo: state.selected.chapter_no });
-  if (!response.ok) { button.disabled = false; return setStatus("草稿对账失败", response.error, "danger"); }
+  if (!response.ok) {
+    setActionResult(`核对失败：${response.error}`, "danger");
+    return setStatus("草稿对账失败", response.error, "danger");
+  }
   if (response.result.matched) {
     setStatus("草稿内容一致", "已确认服务器当前版本。", "ok");
     await loadChapters();
@@ -543,18 +495,6 @@ async function reconcileSelected() {
     setStatus("发现草稿版本差异", "已停止且未覆盖。", "warn");
     $("previewBody").textContent = `=== 服务器版本 ===\n${response.result.expectedBody}\n\n=== 番茄草稿 ===\n${response.result.observedBody}`;
   }
-}
-
-async function fillSelected() {
-  if (!state.selected) return;
-  const button = $("fillChapter"); button.disabled = true;
-  setStatus("正在填充当前章节…", "页面或内容不符合预期时会立即停止。", "neutral");
-  setActionResult("正在检查当前番茄编辑页，请稍候…", "neutral");
-  const response = await send({ type: "fillChapter", bookId: state.selected.book_id, chapterNo: state.selected.chapter_no });
-  if (!response.ok) { button.disabled = false; setActionResult(`填充失败：${response.error}`, "danger"); return setStatus("填充已停止", response.error, "danger"); }
-  setActionResult(`填充成功：第 ${state.selected.chapter_no} 章已写入并通过页面校验。`, "ok");
-  setStatus("填充并校验成功", `已填入 ${response.result.observedCharCount} 个可见字符；可继续批准计划或人工处理。`, "ok");
-  await loadChapters();
 }
 
 function currentPlanItem(chapterNo) { return state.currentPlan?.items?.find((item) => Number(item.chapter_no) === Number(chapterNo)); }
@@ -567,6 +507,7 @@ function escapeHtml(value) { return String(value || "").replaceAll("&", "&amp;")
 
 function chapterStatusLabel(chapter) {
   if (["scheduled_unverified", "published_unverified", "draft_unverified"].includes(chapter.platform_state)) return "平台已有，待核对";
+  if (chapter.status === "blocked" && chapter.recovery?.allowed) return "上次未提交，待自动恢复";
   const labels = {
     ready: "待发布",
     synced: "待发布",

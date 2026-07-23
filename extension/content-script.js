@@ -1,6 +1,6 @@
 "use strict";
 
-const PAGE_ADAPTER_VERSION = "0.3.2";
+const PAGE_ADAPTER_VERSION = "0.3.3";
 
 // Selector strategy adapted from NonoOi/fanqie-author-injector (MIT); see THIRD_PARTY_NOTICES.md.
 const FIELD_SELECTORS = {
@@ -74,7 +74,7 @@ async function dispatchPageAction(message) {
     case "inspectPage":
       return inspectPage(message.bookName || null, message.workId || null);
     case "openNewChapter":
-      return openNewChapter(message.bookName || null, message.workId || null);
+      return openNewChapter(message.bookName || null, message.workId || null, message.timeoutMs);
     case "clickNext":
       return await clickNext(message.chapter);
     case "completePublicationFlow":
@@ -82,7 +82,7 @@ async function dispatchPageAction(message) {
     case "submitPreparedPublication":
       return submitPreparedPublication(message.options || {});
     case "inspectPublicationList":
-      return inspectPublicationList(message.chapterNos || []);
+      return inspectPublicationList(message.chapterNos || [], message.timeoutMs);
     case "inspectWorks":
       return inspectWorks(message.bookName || null);
     default:
@@ -409,6 +409,10 @@ const AUTOMATION_LIMITS = {
 };
 const EDITOR_READY_TIMEOUT_MS = 10_000;
 const EDITOR_SETTLE_TIMEOUT_MS = 4_000;
+const NEW_CHAPTER_READY_TIMEOUT_MS = 15_000;
+const PUBLICATION_LIST_TIMEOUT_MS = 15_000;
+const PUBLICATION_LIST_STABLE_MS = 1_200;
+const PUBLICATION_LIST_MIN_SETTLE_MS = 1_800;
 
 function inspectPage(expectedBookName = null, expectedWorkId = null) {
   const body = visiblePageText();
@@ -451,21 +455,59 @@ function inspectPage(expectedBookName = null, expectedWorkId = null) {
   };
 }
 
-function openNewChapter(expectedBookName = null, expectedWorkId = null) {
+async function openNewChapter(expectedBookName = null, expectedWorkId = null, timeoutMs = null) {
   const pageText = visiblePageText();
-  if (isLoginPage(pageText)) return failure("番茄登录状态已失效，请先登录。", "login_required");
+  if (isLoginPage(pageText)) {
+    return failure("番茄登录状态已失效，请先登录。", "login_required", { mutationAttempted: false });
+  }
   const currentWorkId = extractPlatformWorkId(location.href);
   if (expectedWorkId && currentWorkId !== String(expectedWorkId)) {
-    return failure("当前番茄页面不是已绑定的目标作品，拒绝创建章节。", "work_identity_mismatch", { currentWorkId, expectedWorkId });
+    return failure("当前番茄页面不是已绑定的目标作品，拒绝创建章节。", "work_identity_mismatch", {
+      currentWorkId, expectedWorkId, mutationAttempted: false
+    });
   }
   if (!expectedWorkId && expectedBookName && !normalizeCompact(pageText).includes(normalizeCompact(expectedBookName))) {
-    return failure("当前作家后台没有识别到目标作品，拒绝创建章节。", "work_identity_mismatch");
+    return failure("当前作家后台没有识别到目标作品，拒绝创建章节。", "work_identity_mismatch", {
+      mutationAttempted: false
+    });
   }
-  const root = !expectedWorkId && expectedBookName ? findWorkRoot(expectedBookName) : document;
-  const button = findActionButton(["新建章节", "新建章"], root || document).element;
-  if (!button) return failure("没有找到可验证的“新建章节”按钮。", "new_chapter_button_missing");
-  clickVisible(button);
-  return { ok: true, code: "new_chapter_clicked", page: inspectPage() };
+
+  // “新建章节”只负责可逆的页面导航。番茄是 SPA，标题栏通常比按钮先挂载，
+  // 因此在一次用户点击中等待按钮出现，而不是让用户反复点击插件。
+  const requestedWait = timeoutMs === null || timeoutMs === undefined ? NEW_CHAPTER_READY_TIMEOUT_MS : Number(timeoutMs);
+  const waitMs = Number.isFinite(requestedWait)
+    ? Math.min(Math.max(requestedWait, 0), NEW_CHAPTER_READY_TIMEOUT_MS)
+    : NEW_CHAPTER_READY_TIMEOUT_MS;
+  const deadline = Date.now() + waitMs;
+  const actionRoot = () => (!expectedWorkId && expectedBookName ? findWorkRoot(expectedBookName) : document) || document;
+  let found = findNewChapterControl(actionRoot());
+  while (!found.element && Date.now() < deadline) {
+    await sleep(Math.min(AUTOMATION_LIMITS.pollMs, Math.max(1, deadline - Date.now())));
+    found = findNewChapterControl(actionRoot());
+  }
+  if (!found.element) {
+    return failure(
+      "章节管理页已经打开，但“新建章节”按钮在 15 秒内仍未加载。页面未被操作，请直接重试主按钮。",
+      "new_chapter_button_missing",
+      { mutationAttempted: false, candidates: found.candidates, url: location.href }
+    );
+  }
+  try {
+    clickVisible(found.element);
+  } catch (error) {
+    return failure(normalizeError(error), "new_chapter_click_rejected", {
+      mutationAttempted: false,
+      selected: describeActionElement(found.element),
+      candidates: found.candidates
+    });
+  }
+  return {
+    ok: true,
+    code: "new_chapter_clicked",
+    mutationAttempted: true,
+    selected: describeActionElement(found.element),
+    page: inspectPage()
+  };
 }
 
 async function clickNext(chapter) {
@@ -788,17 +830,89 @@ function inspectWorks(expectedBookName = null) {
   };
 }
 
-function inspectPublicationList(chapterNos) {
-  const text = visiblePageText();
-  if (isLoginPage(text)) return failure("番茄登录状态已失效，请先登录。", "login_required");
-  if (!/章节管理|章节列表|草稿箱/iu.test(text)) {
-    return failure("当前页面不是可验证的章节管理/章节列表页面。", "publication_list_not_recognized");
+async function inspectPublicationList(chapterNos, timeoutMs = null) {
+  const requestedWait = timeoutMs === null || timeoutMs === undefined ? PUBLICATION_LIST_TIMEOUT_MS : Number(timeoutMs);
+  const waitMs = Number.isFinite(requestedWait)
+    ? Math.min(Math.max(requestedWait, 0), PUBLICATION_LIST_TIMEOUT_MS)
+    : PUBLICATION_LIST_TIMEOUT_MS;
+  const deadline = Date.now() + waitMs;
+  let firstReadyAt = 0;
+  let stableSince = 0;
+  let stableSignature = null;
+  let lastSnapshot = null;
+
+  while (Date.now() < deadline) {
+    const snapshot = readPublicationListSnapshot(chapterNos);
+    lastSnapshot = snapshot;
+    if (snapshot.loginRequired) {
+      return failure("番茄登录状态已失效，请先登录。", "login_required", {
+        listStable: false, newChapterReady: false, url: location.href
+      });
+    }
+
+    // A usable toolbar is not proof that the asynchronous list data has arrived.
+    // Negative evidence ("chapter N is absent") is accepted only after we can see
+    // at least one real chapter record, or an explicit empty-list state.
+    const ready = snapshot.recognized && !snapshot.loading && snapshot.newChapterReady && snapshot.listContentReady;
+    if (ready) {
+      if (!firstReadyAt) firstReadyAt = Date.now();
+      const signature = publicationSnapshotSignature(snapshot);
+      if (signature !== stableSignature) {
+        stableSignature = signature;
+        stableSince = Date.now();
+      }
+      const settledLongEnough = Date.now() - firstReadyAt >= PUBLICATION_LIST_MIN_SETTLE_MS;
+      const unchangedLongEnough = Date.now() - stableSince >= PUBLICATION_LIST_STABLE_MS;
+      if (settledLongEnough && unchangedLongEnough) {
+        return {
+          ...snapshot,
+          ok: true,
+          state: "publication_list",
+          listStable: true,
+          stabilityMs: Date.now() - stableSince
+        };
+      }
+    } else {
+      firstReadyAt = 0;
+      stableSince = 0;
+      stableSignature = null;
+    }
+    await sleep(AUTOMATION_LIMITS.pollMs);
   }
-  const rowCandidates = [...document.querySelectorAll("tr, li, article, [role='row'], [class*='chapter'], [class*='row'], div")]
-    .filter(isVisible)
-    .map((element) => normalizeBody(readField(element)))
-    .filter((value) => value && value.length <= 1600);
-  const textLines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+
+  const details = {
+    ...(lastSnapshot || {}),
+    ok: false,
+    listStable: false,
+    url: location.href
+  };
+  if (!lastSnapshot?.recognized) {
+    return failure("15 秒内没有识别到完整的章节管理页。请确认番茄页面可正常打开后重试。", "publication_list_not_recognized", details);
+  }
+  if (!lastSnapshot?.newChapterReady) {
+    return failure("章节管理页尚未加载完成：“新建章节”按钮不可用。页面未被读取为“章节不存在”。", "publication_list_not_ready", details);
+  }
+  if (!lastSnapshot?.listContentReady) {
+    return failure("章节管理页的工具栏已经出现，但章节列表数据尚未加载。页面未被读取为“章节不存在”。", "publication_list_content_not_ready", details);
+  }
+  return failure("章节列表仍在加载或变化，未使用这次不完整结果。请直接重试主按钮。", "publication_list_unstable", details);
+}
+
+function readPublicationListSnapshot(chapterNos) {
+  const text = visiblePageText();
+  const loginRequired = isLoginPage(text);
+  const recognized = /章节管理|章节列表|草稿箱/iu.test(text);
+  const newChapter = findNewChapterControl();
+  const loading = publicationListIsLoading(text);
+  const rowCandidates = recognized
+    ? [...document.querySelectorAll("tr, li, article, [role='row'], [class*='chapter'], [class*='row'], div")]
+      .filter(isVisible)
+      .map((element) => normalizeBody(readField(element)))
+      .filter((value) => value && value.length <= 1600)
+    : [];
+  const textLines = recognized ? text.split("\n").map((line) => line.trim()).filter(Boolean) : [];
+  const listRecords = recognized ? publicationListRecords(rowCandidates) : [];
+  const emptyList = recognized && publicationListHasExplicitEmptyState(textLines);
   const rows = [];
   for (const chapterNo of chapterNos.map(Number)) {
     const rowText = findChapterRowText(chapterNo, rowCandidates, textLines);
@@ -824,7 +938,74 @@ function inspectPublicationList(chapterNos) {
       publicationTime
     });
   }
-  return { ok: true, state: "publication_list", url: location.href, workId: extractPlatformWorkId(location.href), rows };
+  return {
+    ok: false,
+    state: recognized ? "publication_list_loading" : "unknown",
+    url: location.href,
+    workId: extractPlatformWorkId(location.href),
+    loginRequired,
+    recognized,
+    loading,
+    listStable: false,
+    listContentReady: listRecords.length > 0 || emptyList,
+    emptyList,
+    observedChapterNos: [...new Set(listRecords.flatMap((value) => [...distinctChapterNumbers(value)]))].sort((a, b) => a - b),
+    listRecordSignature: listRecords.map((value) => normalizeCompact(value).slice(0, 500)),
+    newChapterReady: Boolean(newChapter.element),
+    newChapterCandidates: newChapter.candidates,
+    rows
+  };
+}
+
+function publicationSnapshotSignature(snapshot) {
+  return JSON.stringify({
+    workId: snapshot.workId || null,
+    newChapterReady: Boolean(snapshot.newChapterReady),
+    listContentReady: Boolean(snapshot.listContentReady),
+    emptyList: Boolean(snapshot.emptyList),
+    observedChapterNos: snapshot.observedChapterNos || [],
+    listRecordSignature: snapshot.listRecordSignature || [],
+    rows: (snapshot.rows || []).map((row) => ({
+      chapterNo: Number(row.chapterNo),
+      found: Boolean(row.found),
+      platformStatus: row.platformStatus,
+      publicationDate: row.publicationDate || null,
+      publicationTime: row.publicationTime || null,
+      text: normalizeCompact(row.text || "")
+    }))
+  });
+}
+
+function publicationListRecords(rowCandidates) {
+  const chapterPattern = /第\s*\d+\s*章/iu;
+  const statePattern = /定时|待发布|已安排|已发布|已上线|草稿|未提交|审核中|待审核|审核通过|审核未通过|审核失败|驳回/iu;
+  const records = rowCandidates
+    .filter((value) => chapterPattern.test(value) && statePattern.test(value))
+    // List/table ancestors mention several chapters and do not represent one record.
+    .filter((value) => distinctChapterNumbers(value).size === 1)
+    .map((value) => normalizeBody(value).slice(0, 1200));
+  return [...new Set(records)].sort();
+}
+
+function publicationListHasExplicitEmptyState(textLines) {
+  const exactEmpty = /^(?:暂无(?:章节|章节数据)|暂未(?:创建|发布|添加)?章节|还没有章节|尚无章节)(?:[，。！!；;：:]?.{0,20})?$/iu;
+  if (textLines.some((line) => line.length <= 60 && exactEmpty.test(line))) return true;
+  return [...document.querySelectorAll("[class*='empty'], [class*='Empty'], [data-testid*='empty'], [data-test*='empty']")]
+    .filter(isVisible)
+    .map((element) => normalizeBody(readField(element)))
+    .some((value) => value.length <= 120 && exactEmpty.test(value));
+}
+
+function publicationListIsLoading(text) {
+  if (document.readyState !== "complete") return true;
+  if (/(?:^|\n)\s*(?:加载中|正在加载|请稍候)[…。.\s]*(?:$|\n)/iu.test(String(text || ""))) return true;
+  return [...document.querySelectorAll(
+    "[aria-busy='true'], [role='progressbar'], [class*='skeleton'], [class*='spin-loading'], [class*='spinning']"
+  )].some((element) => {
+    if (!isVisible(element)) return false;
+    const marker = `${element.id || ""} ${typeof element.className === "string" ? element.className : ""}`;
+    return element.getAttribute("aria-busy") === "true" || /skeleton|spin-loading|spinning/iu.test(marker);
+  });
 }
 
 function findChapterRowText(chapterNo, rowCandidates, textLines) {
@@ -946,7 +1127,7 @@ function findWorkRoot(bookName) {
   const candidates = [...document.querySelectorAll("article, tr, li, [class*='book'], [class*='card'], [class*='row'], main, body")]
     .filter(isVisible)
     .filter((element) => normalizeCompact(readField(element)).includes(expected))
-    .filter((element) => findActionButton(["新建章节", "新建章"], element).element)
+    .filter((element) => findNewChapterControl(element).element)
     .sort((a, b) => readField(a).length - readField(b).length);
   return candidates[0] || null;
 }
@@ -1018,6 +1199,76 @@ function describeActionElement(element) {
       width: Math.round(rect.width),
       height: Math.round(rect.height)
     }
+  };
+}
+
+function findNewChapterControl(root = document) {
+  const wanted = new Set([normalizeCompact("新建章节"), normalizeCompact("新建章")]);
+  const excluded = (element) => Boolean(element.closest(
+    "[role='dialog'], [aria-modal='true'], [class*='guide'], [class*='tutorial'], [class*='tour'], [class*='popover']"
+  ));
+  const smallEnough = (element) => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && rect.width <= 420 && rect.height <= 140 && rect.width * rect.height <= 45_000;
+  };
+  const candidates = [];
+  const seen = new Set();
+  const add = (element, priority, source) => {
+    if (!element || seen.has(element) || !isVisible(element) || !isActionEnabled(element) || excluded(element)) return;
+    if (!wanted.has(actionText(element))) return;
+    if (source !== "semantic" && !smallEnough(element)) return;
+    seen.add(element);
+    const descriptor = describeActionElement(element);
+    const actionArea = Boolean(element.closest(
+      "header, [class*='header'], [class*='toolbar'], [class*='operation'], [class*='action']"
+    ));
+    candidates.push({ element, priority: priority + (actionArea ? 20 : 0), source, actionArea, descriptor });
+  };
+
+  for (const element of root.querySelectorAll(
+    "button, [role='button'], a[href], input[type='button'], input[type='submit']"
+  )) add(element, 300, "semantic");
+
+  // Some Fanqie releases render a button as exact text in a span/div inside a custom
+  // clickable div. Climb only to a small exact-text clickable ancestor; never click a
+  // large list/header container merely because it contains the phrase.
+  for (const leaf of root.querySelectorAll("span, div")) {
+    if (!isVisible(leaf) || !wanted.has(actionText(leaf)) || excluded(leaf)) continue;
+    const nestedExact = [...leaf.children].some((child) => wanted.has(actionText(child)));
+    if (nestedExact) continue;
+    let candidate = leaf.closest("button, [role='button'], a[href], [tabindex]");
+    if (!candidate) {
+      let current = leaf;
+      for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+        const marker = `${current.id || ""} ${typeof current.className === "string" ? current.className : ""}`;
+        // cursor is inherited, so computedStyle alone would make a harmless child span
+        // look clickable when only a huge ancestor owns the click. Require evidence on
+        // the candidate element itself.
+        const computedPointer = window.getComputedStyle(current).cursor === "pointer";
+        const inheritedPointer = current.parentElement
+          ? window.getComputedStyle(current.parentElement).cursor === "pointer"
+          : false;
+        const explicitPointer = current.style?.cursor === "pointer" || (computedPointer && !inheritedPointer);
+        const clickable = typeof current.onclick === "function" || explicitPointer || /(?:^|[\s_-])(?:btn|button|create|add|new|action)(?:$|[\s_-])/iu.test(marker);
+        if (clickable) { candidate = current; break; }
+      }
+    }
+    if (candidate) add(candidate, 220, "custom-clickable");
+  }
+
+  candidates.sort((a, b) => (
+    b.priority - a.priority ||
+    a.descriptor.rect.top - b.descriptor.rect.top ||
+    b.descriptor.rect.right - a.descriptor.rect.right
+  ));
+  return {
+    element: candidates[0]?.element || null,
+    candidates: candidates.slice(0, 12).map((item) => ({
+      ...item.descriptor,
+      source: item.source,
+      actionArea: item.actionArea,
+      priority: item.priority
+    }))
   };
 }
 
