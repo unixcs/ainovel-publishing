@@ -1,6 +1,6 @@
 "use strict";
 
-const PAGE_ADAPTER_VERSION = "0.3.3";
+const PAGE_ADAPTER_VERSION = "0.3.4";
 
 // Selector strategy adapted from NonoOi/fanqie-author-injector (MIT); see THIRD_PARTY_NOTICES.md.
 const FIELD_SELECTORS = {
@@ -76,7 +76,7 @@ async function dispatchPageAction(message) {
     case "openNewChapter":
       return openNewChapter(message.bookName || null, message.workId || null, message.timeoutMs);
     case "clickNext":
-      return await clickNext(message.chapter);
+      return await clickNext(message.chapter, message.timeoutMs);
     case "completePublicationFlow":
       return completePublicationFlow(message.options || {});
     case "submitPreparedPublication":
@@ -102,16 +102,22 @@ async function inspectChapter(chapter) {
 }
 
 async function fillChapter(chapter) {
-  // Fanqie's editor is rendered asynchronously. A single immediate query caused the
-  // old UI to fail once and succeed on the second click. Wait here so one click has
-  // one deterministic outcome.
-  const ready = await waitForEditorFields();
+  // Fanqie's new-chapter route first mounts a temporary blank editor, then assigns a
+  // persistent draft id and remounts the controlled React/ProseMirror tree. Writing to
+  // that temporary tree looks successful for a moment and is then erased. Wait for the
+  // persistent route and stable field nodes before the first write.
+  const ready = await waitForHydratedEditor();
   if (!ready.value) {
     const fields = locateFields();
     return failure(
-      "当前页面不是章节编辑页，或编辑器在 10 秒内没有加载完成。请停留在编辑页后重试。",
-      fields.titleField ? "editor_missing" : "title_missing",
-      { diagnostics: fields.diagnostics }
+      "番茄的新章节草稿或编辑器在 15 秒内没有稳定下来，页面尚未填充。请直接重试主按钮。",
+      fields.titleField ? "editor_not_hydrated" : "title_missing",
+      {
+        url: location.href,
+        draftId: extractPlatformDraftId(location.href),
+        nextTextEvidence: findExactNextTextEvidence(),
+        diagnostics: fields.diagnostics
+      }
     );
   }
 
@@ -146,20 +152,24 @@ async function fillChapter(chapter) {
     });
   }
 
-  if (fields.chapterNumberField && !beforeChapterNo) fillField(fields.chapterNumberField, expectedChapterNo, false);
-  if (!beforeTitle) fillField(fields.titleField, expectedTitle, false);
-  if (editorIsEmpty) fillField(fields.editor, expectedBody, true);
+  fillExpectedChapterFields(fields, chapter);
 
-  // React/ProseMirror may replace the edited node after the input event. Re-locate and
-  // wait for the controlled state to settle rather than making the user click twice.
-  const verified = await waitFor(() => {
-    const current = locateFields();
-    if (!current.titleField || !current.editor) return false;
-    const comparison = compareChapterFields(current, chapter);
-    return comparison.ok && comparison.titleMatches && comparison.bodyMatches && comparison.chapterMatches
-      ? { value: { fields: current, comparison } }
-      : false;
-  }, Date.now() + EDITOR_SETTLE_TIMEOUT_MS);
+  // A single matching read is not durable evidence: the editor can still remount one or
+  // two seconds later. Require the same complete chapter to survive continuously across
+  // the settling window before looking for “下一步”.
+  const expectedDraftId = ready.draftId || extractPlatformDraftId(location.href);
+  let refilledAfterRemount = false;
+  let verified = await waitForStableChapterContent(chapter, {
+    allowRefillableBlank: true,
+    expectedDraftId
+  });
+  if (!verified.value && verified.refillable && verified.fields) {
+    // The same persistent draft replaced our editor with a new empty tree. Refill that
+    // one verified-empty tree once; never overwrite non-empty or conflicting content.
+    fillExpectedChapterFields(verified.fields, chapter);
+    refilledAfterRemount = true;
+    verified = await waitForStableChapterContent(chapter, { expectedDraftId });
+  }
 
   if (!verified.value) {
     fields = locateFields();
@@ -184,6 +194,10 @@ async function fillChapter(chapter) {
     observedChapterNo: result.observedChapterNo,
     observedCharCount: result.observedCharCount,
     alreadyPresent: Boolean(beforeTitle && !editorIsEmpty),
+    refilledAfterRemount,
+    url: location.href,
+    draftId: ready.draftId || extractPlatformDraftId(location.href),
+    contentStabilityMs: verified.stabilityMs || 0,
     diagnostics: verified.value.fields.diagnostics
   };
 }
@@ -215,6 +229,141 @@ async function waitForEditorFields(timeoutMs = EDITOR_READY_TIMEOUT_MS) {
     const fields = locateFields();
     return fields.titleField && fields.editor ? { value: fields } : false;
   }, Date.now() + timeoutMs);
+}
+
+async function waitForHydratedEditor(timeoutMs = EDITOR_HYDRATION_TIMEOUT_MS) {
+  if (!isFanqiePublishEditorRoute()) return waitForEditorFields(Math.min(timeoutMs, EDITOR_READY_TIMEOUT_MS));
+
+  const deadline = Date.now() + timeoutMs;
+  let stableSince = 0;
+  let stableIdentity = null;
+  while (Date.now() < deadline) {
+    const fields = locateFields();
+    const draftId = extractPlatformDraftId(location.href);
+    const nextEvidence = findExactNextTextEvidence();
+    const ready = document.readyState === "complete" && fields.titleField && fields.editor && draftId && nextEvidence.length;
+    if (ready) {
+      const identity = {
+        url: location.href,
+        titleField: fields.titleField,
+        chapterNumberField: fields.chapterNumberField,
+        editor: fields.editor
+      };
+      const unchanged = stableIdentity && stableIdentity.url === identity.url &&
+        stableIdentity.titleField === identity.titleField &&
+        stableIdentity.chapterNumberField === identity.chapterNumberField &&
+        stableIdentity.editor === identity.editor;
+      if (!unchanged) {
+        stableIdentity = identity;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince >= EDITOR_HYDRATION_STABLE_MS) {
+        return { value: fields, draftId, nextTextEvidence: nextEvidence };
+      }
+    } else {
+      stableIdentity = null;
+      stableSince = 0;
+    }
+    await sleep(AUTOMATION_LIMITS.pollMs);
+  }
+  return { value: false };
+}
+
+function fillExpectedChapterFields(fields, chapter) {
+  const expectedTitle = pureTitle(chapter.title);
+  const expectedBody = normalizeBody(chapter.body);
+  const expectedChapterNo = String(chapter.chapter_no);
+  const currentTitle = readField(fields.titleField).trim();
+  const currentBody = normalizeBody(readField(fields.editor));
+  const currentChapterNo = fields.chapterNumberField ? readField(fields.chapterNumberField).trim() : "";
+  if (fields.chapterNumberField && !currentChapterNo) fillField(fields.chapterNumberField, expectedChapterNo, false);
+  if (!currentTitle) fillField(fields.titleField, expectedTitle, false);
+  if (isEmptyEditorText(currentBody)) fillField(fields.editor, expectedBody, true);
+}
+
+function chapterFieldsAreSafelyRefillable(fields, chapter) {
+  if (!fields?.titleField || !fields?.editor) return false;
+  const title = readField(fields.titleField).trim();
+  const body = normalizeBody(readField(fields.editor));
+  const chapterNo = fields.chapterNumberField ? readField(fields.chapterNumberField).trim() : "";
+  const titleSafe = !title || normalizeCompact(title) === normalizeCompact(pureTitle(chapter.title));
+  const bodySafe = isEmptyEditorText(body) || body === normalizeBody(chapter.body);
+  const chapterSafe = !chapterNo || normalizeChapterNumber(chapterNo) === String(chapter.chapter_no);
+  return titleSafe && bodySafe && chapterSafe && isEmptyEditorText(body);
+}
+
+async function waitForStableChapterContent(chapter, {
+  timeoutMs = EDITOR_SETTLE_TIMEOUT_MS,
+  allowRefillableBlank = false,
+  expectedDraftId = null
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  const requiredStableMs = isFanqiePublishEditorRoute() ? EDITOR_CONTENT_STABLE_MS : 250;
+  let stableSince = 0;
+  let stableIdentity = null;
+  let matchedOnce = false;
+  let blankSince = 0;
+  let blankIdentity = null;
+  let lastFields = null;
+  let lastComparison = null;
+  while (Date.now() < deadline) {
+    const fields = locateFields();
+    lastFields = fields;
+    if (fields.titleField && fields.editor) {
+      const comparison = compareChapterFields(fields, chapter);
+      lastComparison = comparison;
+      const matches = comparison.titleMatches && comparison.bodyMatches && comparison.chapterMatches;
+      const identity = {
+        url: location.href,
+        titleField: fields.titleField,
+        chapterNumberField: fields.chapterNumberField,
+        editor: fields.editor
+      };
+      const unchanged = stableIdentity && stableIdentity.url === identity.url &&
+        stableIdentity.titleField === identity.titleField &&
+        stableIdentity.chapterNumberField === identity.chapterNumberField &&
+        stableIdentity.editor === identity.editor;
+      if (matches) {
+        matchedOnce = true;
+        blankSince = 0;
+        blankIdentity = null;
+        if (!unchanged) {
+          stableIdentity = identity;
+          stableSince = Date.now();
+        } else if (Date.now() - stableSince >= requiredStableMs) {
+          return { value: { fields, comparison }, stabilityMs: Date.now() - stableSince };
+        }
+      } else {
+        stableIdentity = null;
+        stableSince = 0;
+        const currentDraftId = extractPlatformDraftId(location.href);
+        const sameDraft = !expectedDraftId || currentDraftId === expectedDraftId;
+        const safelyBlank = matchedOnce && allowRefillableBlank && sameDraft && chapterFieldsAreSafelyRefillable(fields, chapter);
+        if (safelyBlank) {
+          const identityUnchanged = blankIdentity && blankIdentity.url === identity.url &&
+            blankIdentity.titleField === identity.titleField &&
+            blankIdentity.chapterNumberField === identity.chapterNumberField &&
+            blankIdentity.editor === identity.editor;
+          if (!identityUnchanged) {
+            blankIdentity = identity;
+            blankSince = Date.now();
+          } else if (Date.now() - blankSince >= EDITOR_HYDRATION_STABLE_MS) {
+            return { value: false, refillable: true, fields, comparison };
+          }
+        } else {
+          blankSince = 0;
+          blankIdentity = null;
+        }
+      }
+    } else {
+      stableIdentity = null;
+      stableSince = 0;
+      lastComparison = null;
+      blankSince = 0;
+      blankIdentity = null;
+    }
+    await sleep(AUTOMATION_LIMITS.pollMs);
+  }
+  return { value: false, fields: lastFields, comparison: lastComparison };
 }
 
 function locateFields() {
@@ -408,7 +557,12 @@ const AUTOMATION_LIMITS = {
   pollMs: 250
 };
 const EDITOR_READY_TIMEOUT_MS = 10_000;
-const EDITOR_SETTLE_TIMEOUT_MS = 4_000;
+const EDITOR_HYDRATION_TIMEOUT_MS = 15_000;
+const EDITOR_HYDRATION_STABLE_MS = 1_000;
+const EDITOR_SETTLE_TIMEOUT_MS = 8_000;
+const EDITOR_CONTENT_STABLE_MS = 2_500;
+const NEXT_READY_TIMEOUT_MS = 15_000;
+const NEXT_READY_STABLE_MS = 500;
 const NEW_CHAPTER_READY_TIMEOUT_MS = 15_000;
 const PUBLICATION_LIST_TIMEOUT_MS = 15_000;
 const PUBLICATION_LIST_STABLE_MS = 1_200;
@@ -510,31 +664,85 @@ async function openNewChapter(expectedBookName = null, expectedWorkId = null, ti
   };
 }
 
-async function clickNext(chapter) {
-  const ready = await waitForEditorFields();
-  if (!ready.value) return failure("点击下一步前未识别到已加载完成的编辑器。", "editor_missing");
+async function clickNext(chapter, timeoutMs = null) {
+  // The real Fanqie action is currently a small custom ByteDance control in the top
+  // editor bar, not always a semantic <button>. Wait for that asynchronous control while
+  // continuously re-checking the chapter. Never use a lower tutorial “下一步”.
+  const requestedWait = timeoutMs === null || timeoutMs === undefined ? NEXT_READY_TIMEOUT_MS : Number(timeoutMs);
+  const waitMs = Number.isFinite(requestedWait)
+    ? Math.min(Math.max(requestedWait, 0), NEXT_READY_TIMEOUT_MS)
+    : NEXT_READY_TIMEOUT_MS;
+  const deadline = Date.now() + waitMs;
+  let candidateSince = 0;
+  let candidateElement = null;
+  let candidateReady = false;
+  let lastFound = { element: null, candidates: [], textEvidence: [] };
+  let lastComparison = null;
+  let lastFields = null;
+  while (Date.now() < deadline) {
+    const fields = locateFields();
+    lastFields = fields;
+    if (fields.titleField && fields.editor) {
+      const comparison = chapter ? compareChapterFields(fields, chapter) : { titleMatches: true, bodyMatches: true, chapterMatches: true };
+      lastComparison = comparison;
+      const contentMatches = comparison.titleMatches && comparison.bodyMatches && comparison.chapterMatches;
+      const found = findStrictNextControl();
+      lastFound = found;
+      if (contentMatches && found.element) {
+        if (candidateElement !== found.element) {
+          candidateElement = found.element;
+          candidateSince = Date.now();
+        } else if (Date.now() - candidateSince >= NEXT_READY_STABLE_MS) {
+          lastFound = found;
+          candidateReady = true;
+          break;
+        }
+      } else {
+        candidateElement = null;
+        candidateSince = 0;
+      }
+    } else {
+      candidateElement = null;
+      candidateSince = 0;
+    }
+    await sleep(AUTOMATION_LIMITS.pollMs);
+  }
+
+  const before = captureTransitionDiagnostics();
+  if (!candidateReady || !lastFound.element || candidateElement !== lastFound.element) {
+    if (lastComparison && (!lastComparison.titleMatches || !lastComparison.bodyMatches || !lastComparison.chapterMatches)) {
+      return failure("等待“下一步”期间，番茄编辑器中的章节内容发生变化，已停止且未点击页面。", "pre_next_mismatch", {
+        observedTitle: lastComparison.observedTitle,
+        observedChapterNo: lastComparison.observedChapterNo,
+        observedCharCount: lastComparison.observedCharCount,
+        candidates: lastFound.candidates,
+        textEvidence: lastFound.textEvidence,
+        diagnostics: before
+      });
+    }
+    return failure(`${Math.ceil(waitMs / 1000)} 秒内没有找到可安全点击的顶部“下一步”控件，已停止且未点击页面。`, "next_button_missing", {
+      candidates: lastFound.candidates,
+      textEvidence: lastFound.textEvidence,
+      fieldDiagnostics: lastFields?.diagnostics || null,
+      diagnostics: before
+    });
+  }
+  const finalFields = locateFields();
   if (chapter) {
-    const comparison = compareChapterFields(ready.value, chapter);
-    if (!comparison.titleMatches || !comparison.bodyMatches || !comparison.chapterMatches) {
-      return failure("点击下一步前页面内容校验失败，已停止。", "pre_next_mismatch", {
-        observedTitle: comparison.observedTitle,
-        observedChapterNo: comparison.observedChapterNo,
-        observedCharCount: comparison.observedCharCount
+    const finalComparison = finalFields.titleField && finalFields.editor ? compareChapterFields(finalFields, chapter) : null;
+    if (!finalComparison || !finalComparison.titleMatches || !finalComparison.bodyMatches || !finalComparison.chapterMatches) {
+      return failure("点击“下一步”前的最终章节校验失败，已停止且未点击页面。", "pre_next_mismatch", {
+        observedTitle: finalComparison?.observedTitle || "",
+        observedChapterNo: finalComparison?.observedChapterNo || "",
+        observedCharCount: finalComparison?.observedCharCount || 0,
+        candidates: lastFound.candidates,
+        textEvidence: lastFound.textEvidence,
+        diagnostics: before
       });
     }
   }
 
-  // “下一步”是一次不可随意猜测的页面操作。只接受真正的 button 或
-  // role=button，文字必须完全相等，并选择页面最下方的有效候选。旧版把普通
-  // div 也当按钮，可能点中新手引导或外层容器，导致编辑器被重挂载/清空。
-  const before = captureTransitionDiagnostics();
-  const found = findStrictNextButton();
-  if (!found.element) {
-    return failure("没有找到唯一可验证的“下一步”按钮，已停止且未操作页面。", "next_button_missing", {
-      candidates: found.candidates,
-      diagnostics: before
-    });
-  }
+  const found = lastFound;
   const selected = describeActionElement(found.element);
   clickVisible(found.element);
   // 让同步的弹窗、SPA 路由或编辑器重挂载先发生，留下可核对的前后证据。
@@ -1272,34 +1480,98 @@ function findNewChapterControl(root = document) {
   };
 }
 
-function findStrictNextButton(root = document) {
-  const candidates = [...root.querySelectorAll("button, [role='button']")]
+function findExactNextTextEvidence(root = document) {
+  const wanted = normalizeCompact("下一步");
+  const topLimit = Math.min(220, Math.max(140, Math.round(window.innerHeight * 0.25)));
+  return [...root.querySelectorAll("button, [role='button'], a[href], input[type='button'], input[type='submit'], span, div")]
     .filter(isVisible)
-    .filter(isActionEnabled)
-    .filter((element) => actionText(element) === normalizeCompact("下一步"))
+    .filter((element) => actionText(element) === wanted)
+    .filter((element) => ![...element.children].some((child) => actionText(child) === wanted))
     .filter((element) => !element.closest(
       "[role='dialog'], [aria-modal='true'], [class*='guide'], [class*='tutorial'], [class*='tour'], [class*='popover']"
     ))
-    .map((element) => {
-      const descriptor = describeActionElement(element);
-      const actionArea = Boolean(element.closest(
-        "footer, [class*='footer'], [class*='bottom'], [class*='action'], [class*='operation'], [class*='operate'], [class*='submit']"
-      ));
-      return { element, descriptor, actionArea };
+    .map((element) => ({ element, descriptor: describeActionElement(element) }))
+    .filter((item) => item.descriptor.rect.top >= -20 && item.descriptor.rect.bottom <= topLimit)
+    .sort((a, b) => a.descriptor.rect.top - b.descriptor.rect.top || b.descriptor.rect.right - a.descriptor.rect.right)
+    .slice(0, 20)
+    .map((item) => item.descriptor);
+}
+
+function findStrictNextControl(root = document, { allowDisabled = false } = {}) {
+  const wanted = normalizeCompact("下一步");
+  const topLimit = Math.min(220, Math.max(140, Math.round(window.innerHeight * 0.25)));
+  const excluded = (element) => Boolean(element.closest(
+    "[role='dialog'], [aria-modal='true'], [class*='guide'], [class*='tutorial'], [class*='tour'], [class*='popover']"
+  ));
+  const candidates = [];
+  const seen = new Set();
+  const add = (element, priority, source) => {
+    if (!element || seen.has(element) || !isVisible(element) || excluded(element)) return;
+    if (!allowDisabled && !isActionEnabled(element)) return;
+    if (actionText(element) !== wanted) return;
+    const descriptor = describeActionElement(element);
+    const rect = descriptor.rect;
+    const smallEnough = rect.width > 0 && rect.height > 0 && rect.width <= 420 && rect.height <= 140 && rect.width * rect.height <= 45_000;
+    if (!smallEnough || rect.top < -20 || rect.bottom > topLimit) return;
+    const marker = `${descriptor.id} ${descriptor.className} ${descriptor.role} ${descriptor.ariaLabel}`;
+    const actionArea = Boolean(element.closest(
+      "header, [class*='header'], [class*='toolbar'], [class*='top'], [class*='action'], [class*='operation'], [class*='operate'], [class*='submit'], [class*='publish']"
+    ));
+    const primary = /primary|submit|publish|next|byte-btn/iu.test(marker);
+    seen.add(element);
+    candidates.push({
+      element,
+      descriptor,
+      source,
+      actionArea,
+      primary,
+      priority: priority + (actionArea ? 40 : 0) + (primary ? 25 : 0)
     });
-  const scoped = candidates.some((item) => item.actionArea)
-    ? candidates.filter((item) => item.actionArea)
-    : candidates;
-  scoped.sort((a, b) => (
-    b.descriptor.rect.bottom - a.descriptor.rect.bottom ||
+  };
+
+  for (const element of root.querySelectorAll(
+    "button, [role='button'], a[href], input[type='button'], input[type='submit']"
+  )) add(element, 400, "semantic");
+
+  // Fanqie's current ByteDance UI renders the real top action as exact text inside a
+  // small custom clickable control. Accept only a proven small top-bar ancestor; a
+  // tutorial/lower-page div that merely contains “下一步” never qualifies.
+  for (const leaf of root.querySelectorAll("span, div")) {
+    if (!isVisible(leaf) || actionText(leaf) !== wanted || excluded(leaf)) continue;
+    if ([...leaf.children].some((child) => actionText(child) === wanted)) continue;
+    let candidate = leaf.closest("button, [role='button'], a[href], [tabindex]");
+    if (!candidate) {
+      let current = leaf;
+      for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+        const marker = `${current.id || ""} ${typeof current.className === "string" ? current.className : ""}`;
+        const computedPointer = window.getComputedStyle(current).cursor === "pointer";
+        const inheritedPointer = current.parentElement
+          ? window.getComputedStyle(current.parentElement).cursor === "pointer"
+          : false;
+        const explicitPointer = current.style?.cursor === "pointer" || (computedPointer && !inheritedPointer);
+        const clickable = typeof current.onclick === "function" || explicitPointer ||
+          /(?:^|[\s_-])(?:byte-?btn|btn|button|next|submit|publish|primary|action|operation|operate)(?:$|[\s_-])/iu.test(marker);
+        if (clickable) { candidate = current; break; }
+      }
+    }
+    if (candidate) add(candidate, 300, "custom-top-action");
+  }
+
+  candidates.sort((a, b) => (
+    b.priority - a.priority ||
+    a.descriptor.rect.top - b.descriptor.rect.top ||
     b.descriptor.rect.right - a.descriptor.rect.right
   ));
   return {
-    element: scoped[0]?.element || null,
-    candidates: candidates
-      .map((item) => ({ ...item.descriptor, actionArea: item.actionArea }))
-      .sort((a, b) => b.rect.bottom - a.rect.bottom)
-      .slice(0, 12)
+    element: candidates[0]?.element || null,
+    candidates: candidates.slice(0, 12).map((item) => ({
+      ...item.descriptor,
+      source: item.source,
+      actionArea: item.actionArea,
+      primary: item.primary,
+      priority: item.priority
+    })),
+    textEvidence: findExactNextTextEvidence(root)
   };
 }
 
@@ -1404,6 +1676,25 @@ function extractPlatformWorkId(url) {
     return workRoot ? workRoot[1] : null;
   } catch (_error) {
     return null;
+  }
+}
+
+function extractPlatformDraftId(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    const matched = pathname.match(/\/main\/writer\/\d{10,}\/publish\/(\d{10,})(?:\/|$)/u);
+    return matched ? matched[1] : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function isFanqiePublishEditorRoute() {
+  try {
+    const url = new URL(location.href);
+    return /(^|\.)fanqienovel\.com$/iu.test(url.hostname) && /\/main\/writer\/\d{10,}\/publish(?:\/|$)/u.test(url.pathname);
+  } catch (_error) {
+    return false;
   }
 }
 

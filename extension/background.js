@@ -13,9 +13,9 @@ const DEFAULT_SETTINGS = {
 const TARGET_ROOT_HOST = "fanqienovel.com";
 const BOOK_MANAGE_URL = "https://fanqienovel.com/main/writer/book-manage";
 const AUTOMATION_ALARM = "ainovel-publication-runner";
-const AUTOMATION_SAFETY_EPOCH = "0.3.3-stable-list-new-chapter-boundary";
+const AUTOMATION_SAFETY_EPOCH = "0.3.4-editor-hydration-top-next";
 const PLATFORM_PREFLIGHT_TTL_MS = 2 * 60 * 1000;
-const PAGE_ADAPTER_VERSION = "0.3.3";
+const PAGE_ADAPTER_VERSION = "0.3.4";
 let automationLock = false;
 const safetyReady = enforceAutomationSafetyEpoch();
 
@@ -320,7 +320,12 @@ async function automateChapter(bookId, chapterNo, planId) {
     const filled = await sendPageAction(editorTab.id, { type: "fillChapter", chapter: chapterPayload(chapter) });
     if (!filled?.ok) throw automationFailure(filled?.error || "自动填充失败。", filled?.code || "fill_failed", filled);
     await safePostEvent(bookId, chapterNo, "filled", chapter.text_sha256, {
-      plan_id: planId, page_url: editorTab.url, observed_char_count: filled.observedCharCount
+      plan_id: planId,
+      page_url: filled.url || editorTab.url,
+      platform_draft_id: filled.draftId || null,
+      observed_char_count: filled.observedCharCount,
+      content_stability_ms: filled.contentStabilityMs || null,
+      refilled_after_editor_remount: Boolean(filled.refilledAfterRemount)
     });
 
     const next = await sendPageAction(editorTab.id, { type: "clickNext", chapter: chapterPayload(chapter) });

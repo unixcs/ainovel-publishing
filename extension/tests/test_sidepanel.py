@@ -45,7 +45,7 @@ def test_simplified_sidepanel_renders_user_labels_without_internal_block_codes()
               sendMessage(payload, callback) {
                 const responses = {
                   getSettings: {baseUrl:'http://127.0.0.1:8787',apiToken:'token',selectedSlot:'20:00',aiPolicy:'remember',automationEnabled:false},
-                  health: {ok:true,version:'0.3.3'},
+                  health: {ok:true,version:'0.3.4'},
                   getPublicationSettings: {daily_limit:9999,slots:['12:00','20:00','22:00'],default_slot:'20:00'},
                   getBooks: {books:[{book_id:'book',name:'示例小说',ready_count:1}]},
                   getChapters: {chapters:[{book_id:'book',chapter_no:6,title:'第六章 夜话',status:'filled',platform_state:null,version:1,char_count:3965,text_sha256:'aaaaaaaaaaaaaaa'}]},
@@ -100,7 +100,7 @@ def test_recoverable_blocked_chapter_has_one_clickable_primary_recovery_action()
               sendMessage(payload, callback) {
                 const responses = {
                   getSettings: {baseUrl:'http://127.0.0.1:8787',apiToken:'token',selectedSlot:'20:00',aiPolicy:'remember',automationEnabled:false},
-                  health: {ok:true,version:'0.3.3'},
+                  health: {ok:true,version:'0.3.4'},
                   getPublicationSettings: {daily_limit:9999,slots:['12:00','20:00','22:00'],default_slot:'20:00'},
                   getBooks: {books:[{book_id:'book',name:'示例小说',ready_count:0}]},
                   getChapters: {chapters:[CHAPTER]},
@@ -168,7 +168,7 @@ def test_background_canonical_navigation_binds_dynamic_work_and_reuses_preflight
                 },
                 async reload(id) {
                   const tab=window.__tabs.find(item => item.id === Number(id)); tab.status='complete';
-                  window.__adapterVersion='0.3.3'; window.__reloadCount += 1;
+                  window.__adapterVersion='0.3.4'; window.__reloadCount += 1;
                 },
                 async create(changes) { const tab={id:99,status:'complete',...changes}; window.__tabs.push(tab); return {...tab}; },
                 async sendMessage(_id, message) {

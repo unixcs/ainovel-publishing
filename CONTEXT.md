@@ -92,6 +92,10 @@ _Avoid_: Automation failure, guessed AI choice
 One controlled attempt to reconcile, fill, submit, and verify one planned chapter version in a local logged-in browser.
 _Avoid_: Macro, click script
 
+**Persistent Editor Readiness**:
+Evidence that Fanqie's temporary new-chapter shell has become one persistent draft context whose chapter fields and primary action no longer remount. Merely seeing a blank editor or a document-ready page does not qualify.
+_Avoid_: Editor visible, page loaded
+
 **Final Submission Boundary**:
 The point at which the workflow authorizes Fanqie's final publish or scheduled-publish action. Editor fill, “Next”, typo confirmation, and full inspection all occur before this boundary.
 _Avoid_: Next click, editor save

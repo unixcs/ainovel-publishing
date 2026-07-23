@@ -88,6 +88,96 @@ def test_placeholder_text_is_treated_as_empty():
         browser.close()
 
 
+def test_fill_waits_for_persistent_fanqie_draft_route_and_editor_remount():
+    html = """
+    <!doctype html><html><body>
+      <main id="editor-root">
+        <input id="old-number" class="serial-input">
+        <input id="old-title" class="serial-editor-input-hint-area">
+        <div id="old-editor" class="ProseMirror" contenteditable="true" style="width:800px;height:500px"></div>
+      </main>
+      <script>
+        window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};
+        window.__oldTouched = false;
+        for (const node of document.querySelectorAll('#old-number,#old-title,#old-editor')) {
+          node.addEventListener('input', () => { window.__oldTouched = true; });
+        }
+        setTimeout(() => {
+          history.replaceState({}, '', '/main/writer/7664986207666850841/publish/7665357226344710718?enter_from=newchapter');
+          document.getElementById('editor-root').innerHTML = `
+            <input id="new-number" class="serial-input">
+            <input id="new-title" class="serial-editor-input-hint-area">
+            <div id="new-editor" class="ProseMirror" contenteditable="true" style="width:800px;height:500px"></div>
+            <div id="real-next" class="byte-btn byte-btn-primary" style="position:fixed;top:20px;right:20px;width:96px;height:36px;cursor:pointer"><span>下一步</span></div>`;
+        }, 600);
+      </script>
+    </body></html>
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width": 1200, "height": 900})
+        page.route(
+            "https://fanqienovel.com/**",
+            lambda route: route.fulfill(status=200, content_type="text/html; charset=utf-8", body=html),
+        )
+        page.goto("https://fanqienovel.com/main/writer/7664986207666850841/publish/?enter_from=newchapter")
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke(page, {
+            "chapter_no": 8,
+            "title": "第八章 兽潮前夜",
+            "body": "第一段。\n\n第二段。",
+            "text_sha256": "8" * 64,
+            "char_count": 8,
+        })
+        assert result["ok"] is True
+        assert page.evaluate("window.__oldTouched") is False
+        assert page.locator("#new-number").input_value() == "8"
+        assert page.locator("#new-title").input_value() == "兽潮前夜"
+        assert "第一段" in page.locator("#new-editor").inner_text()
+        assert page.url.endswith("/publish/7665357226344710718?enter_from=newchapter")
+        browser.close()
+
+
+def test_fill_refills_once_when_same_fanqie_draft_remounts_empty_after_one_second():
+    html = """
+    <!doctype html><html><body>
+      <input class="serial-input">
+      <input class="serial-editor-input-hint-area">
+      <div id="editor" class="ProseMirror" contenteditable="true" style="width:800px;height:500px"></div>
+      <div class="byte-btn byte-btn-primary" style="position:fixed;top:20px;right:20px;width:96px;height:36px;cursor:pointer"><span>下一步</span></div>
+      <script>
+        window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};
+        let clearScheduled = false;
+        document.getElementById('editor').addEventListener('input', () => {
+          if (clearScheduled || !document.getElementById('editor').innerText.trim()) return;
+          clearScheduled = true;
+          setTimeout(() => { document.getElementById('editor').innerHTML = ''; }, 1000);
+        });
+      </script>
+    </body></html>
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width": 1200, "height": 900})
+        page.route(
+            "https://fanqienovel.com/**",
+            lambda route: route.fulfill(status=200, content_type="text/html; charset=utf-8", body=html),
+        )
+        page.goto("https://fanqienovel.com/main/writer/7664986207666850841/publish/7665357226344710718")
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke(page, {
+            "chapter_no": 8,
+            "title": "第八章 兽潮前夜",
+            "body": "第一段。\n\n第二段。",
+            "text_sha256": "8" * 64,
+            "char_count": 8,
+        })
+        assert result["ok"] is True
+        assert result["refilledAfterRemount"] is True
+        assert "第一段" in page.locator("#editor").inner_text()
+        browser.close()
+
+
 def test_largest_editor_is_selected_when_page_has_multiple_editors():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
@@ -124,7 +214,7 @@ def publication_flow_html() -> str:
       <input class="serial-input" value="">
       <input class="serial-editor-input-hint-area" value="">
       <div class="ProseMirror" contenteditable="true" style="width:800px;height:500px"></div>
-      <button id="next">下一步</button>
+      <button id="next" style="position:fixed;top:20px;right:20px">下一步</button>
       <script>
         window.chrome = {runtime: {onMessage: {addListener(fn) { window.__ainovelListener = fn; }}}};
         document.getElementById('next').addEventListener('click', () => {
@@ -644,14 +734,14 @@ def test_next_never_clicks_plain_div_container():
             "document.getElementById('fake-next').onclick = () => window.__clicked.push('fake');",
         ))
         page.add_script_tag(path=str(SCRIPT))
-        result = invoke_action(page, {"type": "clickNext", "chapter": chapter_eight()})
+        result = invoke_action(page, {"type": "clickNext", "chapter": chapter_eight(), "timeoutMs": 100})
         assert result["ok"] is False
         assert result["code"] == "next_button_missing"
         assert page.evaluate("window.__clicked") == []
         browser.close()
 
 
-def test_next_clicks_bottommost_exact_real_button_in_action_area():
+def test_next_clicks_top_editor_action_and_rejects_lower_tutorial_control():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
         page = browser.new_page(viewport={"width": 1200, "height": 900})
@@ -672,14 +762,71 @@ def test_next_clicks_bottommost_exact_real_button_in_action_area():
         page.add_script_tag(path=str(SCRIPT))
         result = invoke_action(page, {"type": "clickNext", "chapter": chapter_eight()})
         assert result["ok"] is True
-        assert result["selected"]["id"] == "bottom-next"
-        assert page.evaluate("window.__clicked") == ["bottom"]
+        assert result["selected"]["id"] == "top-next"
+        assert page.evaluate("window.__clicked") == ["top"]
+        browser.close()
+
+
+def test_next_accepts_small_custom_byte_button_in_top_editor_bar():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width": 1200, "height": 900})
+        page.set_content(editor_action_html(
+            """
+            <div id="real-next" class="byte-btn byte-btn-primary" style="position:fixed;top:20px;right:20px;width:96px;height:36px;cursor:pointer">
+              <span>下一步</span>
+            </div>
+            <div role="dialog" style="position:fixed;top:300px;left:20px;width:300px;height:160px">
+              <button id="guide-next">下一步</button>
+            </div>
+            """,
+            """
+            document.getElementById('real-next').onclick = () => window.__clicked.push('real');
+            document.getElementById('guide-next').onclick = () => window.__clicked.push('guide');
+            """,
+        ))
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {"type": "clickNext", "chapter": chapter_eight()})
+        assert result["ok"] is True
+        assert result["selected"]["id"] == "real-next"
+        assert result["selected"]["text"] == "下一步"
+        assert page.evaluate("window.__clicked") == ["real"]
+        browser.close()
+
+
+def test_next_waits_for_top_custom_control_to_become_enabled():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width": 1200, "height": 900})
+        page.set_content(editor_action_html(
+            """
+            <div id="real-next" class="byte-btn byte-btn-primary disabled" aria-disabled="true"
+                 style="position:fixed;top:20px;right:20px;width:96px;height:36px;cursor:pointer">
+              <span>下一步</span>
+            </div>
+            """,
+            """
+            document.getElementById('real-next').onclick = () => window.__clicked.push('real');
+            setTimeout(() => {
+              const next = document.getElementById('real-next');
+              next.classList.remove('disabled');
+              next.setAttribute('aria-disabled', 'false');
+            }, 700);
+            """,
+        ))
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {
+            "type": "clickNext", "chapter": chapter_eight(), "timeoutMs": 3000,
+        })
+        assert result["ok"] is True
+        assert result["selected"]["id"] == "real-next"
+        assert page.evaluate("window.__clicked") == ["real"]
         browser.close()
 
 
 def test_next_records_url_change_and_editor_remount():
     html = editor_action_html(
-        '<footer class="action-footer"><button id="next">下一步</button></footer>',
+        '<header class="action-header"><button id="next" style="position:fixed;top:20px;right:20px">下一步</button></header>',
         """
         document.getElementById('next').onclick = () => {
           history.pushState({}, '', '/main/writer/7664986207666850841/publish/review');
@@ -709,7 +856,7 @@ def test_unknown_post_next_state_returns_actionable_diagnostics():
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
         page = browser.new_page()
         page.set_content(editor_action_html(
-            '<footer class="action-footer"><button id="next">下一步</button></footer>',
+            '<header class="action-header"><button id="next" style="position:fixed;top:20px;right:20px">下一步</button></header>',
             """
             document.getElementById('next').onclick = () => {
               document.querySelector('.serial-input').remove();

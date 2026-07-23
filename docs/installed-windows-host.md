@@ -14,60 +14,67 @@ Verified on **2026-07-23**.
 
 ## Installed release
 
-- Companion/API and extension files on disk: `0.3.3`
-- Companion health: `0.3.3`; required browser client: `0.3.3`
-- SQLite integrity: `ok`; chapter ledger: `164` rows; event ledger: `281` rows
-- The pre-upgrade 142 rows and their hashes were preserved; the normal startup synchronization added server chapters 143–164 without deleting or replacing an older chapter hash
-- Packaged EXE SHA256: `d77752f62e575296da0bf5bb5c0488b9c2de06efdda51c03078194a259354814`
-- Windows-native companion tests: `37` passed; combined companion/extension suite: `76` passed
-- Publication timezone: `Asia/Shanghai`
-- Daily safety cap: `9999`
+- Companion/API and extension files on disk: `0.3.4`
+- Companion health / required browser client: `0.3.4` / `0.3.4`
+- SQLite integrity: `ok`; chapter ledger: `164` rows; event ledger: `328` rows
+- The original 142 rows and their hashes remain preserved; the prior normal synchronization added server chapters 143–164 without deleting or replacing an older chapter hash
+- Packaged EXE SHA256: `952fa4bf02eab6fd82b8129c9f4ec6248d827ef67137d99be62f0ccefb748784`
+- Windows-native companion tests: `37` passed; combined companion/extension suite: `80` passed
+- Publication timezone: `Asia/Shanghai`; daily safety cap: `9999`
 - Allowed slots: `12:00`, `20:00`, `22:00`; default `20:00`
-- Existing API token, configuration, SSH paths, Chinese release paths, database, and downloaded chapters were preserved
-- Backup: `D:\Program\soft\code\demo\AinovelPublisher\backups\20260723-123537-pre-0.3.3`
-  - original `0.3.2` EXE and extension;
-  - integrity-checked 142-row pre-upgrade database;
-  - integrity-checked 164-row post-sync/pre-fence database;
-  - unchanged `config.json`.
+- Existing API token, configuration, SSH paths, Chinese release paths, database, and downloaded chapters were preserved byte-for-byte where applicable
+- Current backup: `D:\Program\soft\code\demo\AinovelPublisher\backups\20260723-170155-pre-0.3.4`
+  - installed `0.3.3` EXE and extension;
+  - unchanged `config.json`;
+  - integrity-checked database with 164 chapters and 328 events.
+- Earlier pre-0.3.3 backup remains at `D:\Program\soft\code\demo\AinovelPublisher\backups\20260723-123537-pre-0.3.3`.
 
 Windows normally shows two `ainovel-publisher.exe` rows because PyInstaller one-file mode uses a parent/child pair for one service.
 
-## 0.3.3 normal browser path
+## 0.3.4 normal browser path
 
-The ordinary UI now has one primary action: **检查并处理下一章**.
+The ordinary UI still has one primary action: **检查并处理下一章**.
 
-1. Open the bound work's canonical chapter-management URL.
-2. Wait until the SPA has stopped loading, a usable “新建章节” control exists, at least one real chapter row (or an explicit empty-list state) proves the list data arrived, and the whole visible list remains unchanged across the settling window.
-3. Use only that stable snapshot for existing-row reconciliation or platform-absence recovery. A header/button-only or otherwise half-loaded page is never accepted as “all chapters absent”.
-4. Internally create and approve a fresh quota-aware plan. Manual “更新排程 / 批准排程 / 执行下一章” buttons no longer exist.
-5. Wait for the reversible “新建章节” control and click one exact small control. Missing controls return `mutationAttempted:false`, so no-click failures remain retryable instead of becoming `blocked`.
-6. Fill and verify chapter number, title, and body.
-7. Keep the existing strict exact real-button selection for `下一步`, then run known typo/full-check/publish-setting steps.
-8. Persist `final_submit_armed` before the actual final scheduled-publish action. Any ambiguity at or after this point remains reconciliation-only.
-9. Read back the stable chapter list and accept success only when the target date/time matches.
+1. Open the bound work's canonical chapter-management URL and obtain the existing 0.3.3 stable positive-data list observation.
+2. Reconcile platform rows, recover only a pre-final-submit absence, and internally create/approve a fresh quota-aware plan.
+3. Click one exact small “新建章节” control.
+4. Do **not** write to the first blank editor shell. Wait for Fanqie to assign `/publish/<draft-id>`, keep the same title/number/body nodes stable for one second, and observe the top editor action.
+5. Fill chapter number, title, and body. The complete chapter must remain unchanged for 2.5 seconds. If the same draft replaces it with one verified-empty editor tree, refill exactly once and verify again; any non-empty difference stops.
+6. Wait up to 15 seconds for an exact, enabled, small top-bar “下一步” semantic or custom ByteDance control. Lower tutorials/dialogs and large containers never qualify. Revalidate all chapter fields immediately before clicking.
+7. Run the known typo/full-check/publish-setting flow. Persist `final_submit_armed` before the final scheduled-publish action and remain reconciliation-only after any ambiguity at that boundary.
+8. Read back a stable list and accept success only when the target platform date/time matches.
 
-The short-lived platform preflight is consumed by the immediately following mutation. Background/direct runs that do not have a side-panel preflight perform their own stable list read before creating a chapter.
+The short-lived list preflight is target-aware and consumed by the immediately following mutation. Background/direct runs without a side-panel preflight perform their own stable list read.
 
-## Stale-extension fence found during rollout
+## Live evidence behind 0.3.4
 
-While replacing the files, Edge still had the old `0.3.2` service worker in memory. It ran once against the newly synchronized ledger and reproduced the old no-button bug on chapter 13. Version `0.3.3` therefore adds an exact client-version header and companion-side gate on every authenticated API read:
+Four 0.3.3 chapter-8 attempts ended with `next_button_missing`. Each failure record proved:
 
-- a token-only or `0.3.2` request receives HTTP `409 stale_extension_version`;
-- a `0.3.3` request receives HTTP `200`;
-- the old service worker cannot fetch books/plans/chapters, so it cannot reach a page mutation before the user reloads the unpacked extension;
-- after reload, the `0.3.3` safety epoch forces background automatic execution off.
+- the editor still contained the expected title, chapter number, and all `4544` body characters at the checkpoint;
+- `final_submit_armed` was false;
+- the tab had changed from the temporary `/publish/` URL to persistent draft `7665357226344710718`;
+- visible page text started with “下一步”, but no semantic `button`/`role=button` candidate existed.
 
-The live fence was verified with both HTTP outcomes. This is intentionally stricter than a rolling upgrade because browser automation must never mix a new ledger with stale selectors.
+This rules out missing source content. The real defects were writing before Fanqie's persistent draft remount and assuming the top “下一步” was always a semantic button. The regression suite now covers delayed draft-ID assignment, editor remount, one safe same-draft refill, custom top actions, delayed enablement, and rejection of lower tutorials/plain containers.
+
+## Exact browser-version fence
+
+Every authenticated localhost API request carries the extension version. Live 0.3.4 verification produced:
+
+- token-only request: HTTP `409`;
+- `0.3.3` client: HTTP `409`;
+- `0.3.4` client: HTTP `200`.
+
+Thus the already-loaded 0.3.3 Edge worker cannot read a plan or mutate Fanqie after this upgrade. Reloading the unpacked extension is mandatory, and the 0.3.4 safety epoch turns background automatic execution off.
 
 ## Current recovery boundary
 
-No chapter was reset by editing SQLite. The current safe states are:
+No SQLite row was reset manually.
 
-- Chapter 8: `blocked`, recoverable, last verified checkpoint `next_clicked`, no final submission checkpoint.
-- Chapter 9: `blocked`, recoverable, last verified checkpoint `preflight`.
-- Chapter 13: `blocked`, recoverable, last verified checkpoint `preflight`; this is the single stale-0.3.2 rollout incident described above.
+- Chapter 8: `blocked`, recoverable, last verified checkpoint `filled`, last error `next_button_missing`, and no final-submission checkpoint.
+- Chapters 9 and 13: already recovered through the formal absence/recovery API and currently `ready`.
 
-All three require one fresh stable target-work scan. If a row exists on Fanqie, the extension stops and reconciles it. If absent, the same primary action clears the recoverable false blocks through the formal recovery API and **preserves the original next target**, so it returns to chapter 8 instead of skipping to chapter 9 or 13.
+The next primary action performs one new stable list scan. If Fanqie contains chapter 8, it stops and reconciles rather than creating a duplicate. If absent, it formally recovers chapter 8 and runs the 0.3.4 persistent-editor path.
 
 ## Startup
 
@@ -77,13 +84,13 @@ The per-user Startup folder contains:
 %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\AinovelPublisherCompanion.vbs
 ```
 
-It starts `serve --sync-first` hidden at Windows login. During this rollout the latest server sync completed first, then the final fenced `0.3.3` service was started without a second redundant export.
+It starts `serve --sync-first` hidden at Windows login. The current 0.3.4 service was started with `serve` after the already-current database was backed up; no redundant server export was run during this repair.
 
 ## One remaining live browser action
 
 1. Open `edge://extensions` and click **重新加载** on **Ainovel 番茄发布助手**.
-2. Reopen the side panel. It must show **已连接** and no “插件版本未生效” warning.
+2. Reopen the side panel. It must show **已连接** and no stale-version warning.
 3. Keep background automatic execution off and click **检查并处理下一章** once.
-4. Do not manually click Fanqie while the run is active.
+4. Do not manually click or refresh Fanqie while the run is active.
 
-No manual Fanqie-tab refresh, plan update/approval/execution, unblock button, token change, or SQLite edit is required. Runtime API tokens, SQLite data, manuscripts, backups, and compiled executables are not committed to Git.
+No manual platform refresh, plan update/approval/execution, unblock button, token change, or SQLite edit is required. Runtime API tokens, SQLite data, manuscripts, backups, and compiled executables are not committed to Git.
