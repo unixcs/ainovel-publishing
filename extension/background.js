@@ -13,9 +13,9 @@ const DEFAULT_SETTINGS = {
 const TARGET_ROOT_HOST = "fanqienovel.com";
 const BOOK_MANAGE_URL = "https://fanqienovel.com/main/writer/book-manage";
 const AUTOMATION_ALARM = "ainovel-publication-runner";
-const AUTOMATION_SAFETY_EPOCH = "0.3.4-editor-hydration-top-next";
+const AUTOMATION_SAFETY_EPOCH = "0.3.7-packed-quota-and-unique-titles";
 const PLATFORM_PREFLIGHT_TTL_MS = 2 * 60 * 1000;
-const PAGE_ADAPTER_VERSION = "0.3.4";
+const PAGE_ADAPTER_VERSION = "0.3.7";
 let automationLock = false;
 const safetyReady = enforceAutomationSafetyEpoch();
 
@@ -113,12 +113,21 @@ async function handleMessage(message) {
       return reconcileChapter(message.bookId, Number(message.chapterNo));
     case "inspectPlatform":
       return inspectPlatform(message.bookId, message.chapterNos || []);
+    case "rescheduleChapter":
+      return rescheduleChapter(
+        message.bookId,
+        Number(message.chapterNo),
+        String(message.publicationDate || ""),
+        String(message.publicationTime || "")
+      );
     case "inspectActivePage": {
       const tab = await currentFanqieTab();
       return sendPageAction(tab.id, { type: "inspectPage" });
     }
     case "automateChapter":
       return automateChapter(message.bookId, Number(message.chapterNo), message.planId);
+    case "autoSupplementChapter":
+      return autoSupplementChapter(message.bookId, Number(message.chapterNo), message.planId);
     case "continueManualAi":
       return continueManualAi(message.bookId, Number(message.chapterNo), message.planId);
     case "setAutomationEnabled":
@@ -253,6 +262,10 @@ async function automateChapter(bookId, chapterNo, planId) {
       );
     }
     if (chapter.platform_state) {
+      // 安全边界内（我们自己未提交的草稿）直接自动补传，不再卡在人工确认。
+      if (canAutoSupplement(chapter)) {
+        return await autoSupplementChapter(bookId, chapterNo, planId);
+      }
       throw automationFailure(
         `平台状态 ${chapter.platform_state} 尚未完成版本对账，拒绝创建重复章节。`,
         "platform_state_requires_reconciliation",
@@ -350,7 +363,7 @@ async function automateChapter(bookId, chapterNo, planId) {
         publicationTime: item.publication_time,
         aiPolicy: resolvedAiPolicy,
         chapterNo,
-        title: chapter.title,
+        title: chapter.platform_title || chapter.title,
         deferFinalSubmit: true,
         nextTransition: next.transition || null
       }
@@ -380,7 +393,7 @@ async function automateChapter(bookId, chapterNo, planId) {
       publicationTime: publication.publicationTime || item.publication_time,
       aiPolicy: resolvedAiPolicy,
       chapterNo,
-      title: chapter.title
+      title: chapter.platform_title || chapter.title
     };
     await safePostEvent(bookId, chapterNo, "final_submit_armed", chapter.text_sha256, {
       plan_id: planId,
@@ -391,14 +404,38 @@ async function automateChapter(bookId, chapterNo, planId) {
       page_url: postNextTab.url
     });
     finalSubmissionArmed = true;
-    const submitted = await sendPageAction(postNextTab.id, {
-      type: "submitPreparedPublication",
-      options: submitOptions
-    });
-    if (!submitted?.ok) {
-      throw automationFailure(submitted?.error || "最终提交结果未知。", submitted?.code || "submission_unverified", submitted);
+    let submitted = null;
+    try {
+      submitted = await sendPageAction(postNextTab.id, {
+        type: "submitPreparedPublication",
+        options: submitOptions
+      });
+    } catch (error) {
+      // A successful final click can navigate away and destroy the content-script
+      // response channel. Because the final boundary is already armed, do not click
+      // again; use the chapter-management row as the sole authority.
+      submitted = {
+        ok: true,
+        code: "final_submit_response_lost",
+        finalSubmitAttempted: true,
+        responseLost: true,
+        error: normalizeError(error),
+        publicationDate: submitOptions.publicationDate,
+        publicationTime: submitOptions.publicationTime,
+        aiPolicy: submitOptions.aiPolicy
+      };
     }
-    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, submitted);
+    const rejectionError = await recordExplicitSubmissionRejection(
+      bookId, chapter, planId, item, postNextTab, submitted
+    );
+    if (rejectionError) {
+      finalSubmissionArmed = false;
+      throw rejectionError;
+    }
+    if (!submitted?.ok && !submitted?.finalSubmitAttempted) {
+      throw automationFailure(submitted?.error || "最终提交前校验失败。", submitted?.code || "submission_unverified", submitted);
+    }
+    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, submitted, expectedWorkId);
   } catch (error) {
     if (activeChapter && pageMutationStarted) {
       await markBlocked(bookId, chapterNo, planId, activeChapter.text_sha256, error.code || "automation_blocked", {
@@ -451,7 +488,7 @@ async function continueManualAi(bookId, chapterNo, planId) {
         publicationTime: item.publication_time,
         aiPolicy: "remember",
         chapterNo,
-        title: chapter.title,
+        title: chapter.platform_title || chapter.title,
         deferFinalSubmit: true
       }
     });
@@ -463,7 +500,7 @@ async function continueManualAi(bookId, chapterNo, planId) {
       publicationTime: publication.publicationTime || item.publication_time,
       aiPolicy: "remember",
       chapterNo,
-      title: chapter.title
+      title: chapter.platform_title || chapter.title
     };
     await safePostEvent(bookId, chapterNo, "final_submit_armed", chapter.text_sha256, {
       plan_id: planId,
@@ -474,14 +511,35 @@ async function continueManualAi(bookId, chapterNo, planId) {
       page_url: postNextTab.url
     });
     finalSubmissionArmed = true;
-    const submitted = await sendPageAction(postNextTab.id, {
-      type: "submitPreparedPublication",
-      options: submitOptions
-    });
-    if (!submitted?.ok) {
-      throw automationFailure(submitted?.error || "最终提交结果未知。", submitted?.code || "submission_unverified", submitted);
+    let submitted = null;
+    try {
+      submitted = await sendPageAction(postNextTab.id, {
+        type: "submitPreparedPublication",
+        options: submitOptions
+      });
+    } catch (error) {
+      submitted = {
+        ok: true,
+        code: "final_submit_response_lost",
+        finalSubmitAttempted: true,
+        responseLost: true,
+        error: normalizeError(error),
+        publicationDate: submitOptions.publicationDate,
+        publicationTime: submitOptions.publicationTime,
+        aiPolicy: submitOptions.aiPolicy
+      };
     }
-    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, submitted);
+    const rejectionError = await recordExplicitSubmissionRejection(
+      bookId, chapter, planId, item, postNextTab, submitted
+    );
+    if (rejectionError) {
+      finalSubmissionArmed = false;
+      throw rejectionError;
+    }
+    if (!submitted?.ok && !submitted?.finalSubmitAttempted) {
+      throw automationFailure(submitted?.error || "最终提交前校验失败。", submitted?.code || "submission_unverified", submitted);
+    }
+    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, submitted, expectedWorkId);
   } catch (error) {
     if (activeChapter) {
       await markBlocked(bookId, chapterNo, planId, activeChapter.text_sha256, error.code || "automation_blocked", {
@@ -496,7 +554,27 @@ async function continueManualAi(bookId, chapterNo, planId) {
   }
 }
 
-async function submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, publication) {
+async function recordExplicitSubmissionRejection(bookId, chapter, planId, item, tab, submitted) {
+  if (submitted?.ok || !submitted?.submissionRejected) return null;
+  await safePostEvent(bookId, Number(chapter.chapter_no), "submission_rejected", chapter.text_sha256, {
+    plan_id: planId,
+    error: submitted.code || "platform_submission_rejected",
+    platform_state: "draft_rejected",
+    publication_date: item.publication_date,
+    publication_time: item.publication_time,
+    quota_units: item.quota_units,
+    page_url: submitted.url || tab.url,
+    rejection_message: submitted.rejectionMessage || submitted.error || null,
+    final_submit_attempted: true
+  });
+  return automationFailure(
+    submitted.error || "番茄明确拒绝了本次发布，草稿仍保留。",
+    submitted.code || "platform_submission_rejected",
+    submitted
+  );
+}
+
+async function submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, publication, expectedWorkId = null) {
   const chapterNo = Number(chapter.chapter_no);
   await rememberAiChoice(bookId, publication.aiPolicy);
   await safePostEvent(bookId, chapterNo, "schedule_submitted", chapter.text_sha256, {
@@ -509,15 +587,7 @@ async function submitAndVerifyPublication(bookId, chapter, plan, item, postNextT
     evidence: publication.evidence
   });
 
-  let readback = null;
-  try {
-    readback = await sendPageAction(postNextTab.id, {
-      type: "inspectPublicationList",
-      chapterNos: [chapterNo]
-    });
-  } catch (error) {
-    readback = { ok: false, error: normalizeError(error), code: error.code || "readback_script_error" };
-  }
+  const readback = await waitForSubmissionReadback(postNextTab.id, expectedWorkId, chapterNo);
   const expectedDate = publication.publicationDate || item.publication_date;
   const expectedTime = publication.publicationTime || item.publication_time;
   const verifiedRow = readback?.ok
@@ -549,10 +619,52 @@ async function submitAndVerifyPublication(bookId, chapter, plan, item, postNextT
   return { ok: true, chapterNo, publication, readback: verifiedRow };
 }
 
+async function waitForSubmissionReadback(tabId, expectedWorkId, chapterNo, timeoutMs = 50_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status !== "complete") {
+        await sleep(400);
+        continue;
+      }
+      if (expectedWorkId && extractPlatformWorkId(tab.url) !== String(expectedWorkId)) {
+        last = { ok: false, code: "work_identity_mismatch", url: tab.url };
+        await sleep(500);
+        continue;
+      }
+      if (!isChapterManagementUrl(tab.url, expectedWorkId)) {
+        last = { ok: false, code: "awaiting_chapter_management_navigation", url: tab.url };
+        await sleep(500);
+        continue;
+      }
+      const snapshot = await sendPageAction(tabId, {
+        type: "inspectPublicationList",
+        chapterNos: [chapterNo],
+        timeoutMs: Math.min(15_000, Math.max(1_000, deadline - Date.now()))
+      });
+      last = snapshot;
+      if (snapshot?.ok && snapshot.listStable) return snapshot;
+    } catch (error) {
+      last = { ok: false, error: normalizeError(error), code: error.code || "readback_script_error" };
+    }
+    await sleep(500);
+  }
+  return last || { ok: false, code: "submission_readback_timeout" };
+}
+
 async function runApprovedPlanItems() {
   await safetyReady;
   const settings = await chrome.storage.local.get(DEFAULT_SETTINGS);
   if (!settings.automationEnabled || automationLock) return { skipped: true, reason: "automation_disabled_or_busy" };
+  // 定时自动化绝不应主动打开番茄标签页：只有当用户已经打开了作家专区时，才继续处理，
+  // 避免“没有点按钮却莫名打开页面”的异常。手动点击插件按钮的发布流程不受影响。
+  const openTabs = await chrome.tabs.query({ currentWindow: true });
+  const hasOpenFanqie = openTabs.some(
+    (tab) => tab.url && /fanqienovel\.com\/main\/writer/u.test(tab.url)
+  );
+  if (!hasOpenFanqie) return { skipped: true, reason: "no_active_fanqie_tab" };
   const books = await apiRequest("/api/v1/books");
   for (const book of books.books || []) {
     const plans = await apiRequest(`/api/v1/books/${encodeURIComponent(book.book_id)}/publication-plans`);
@@ -904,7 +1016,7 @@ async function inspectPlatform(bookId, chapterNos) {
       continue;
     }
     const matchingEvidence = [...(chapter.events || [])].reverse().find((event) => {
-      if (!["schedule_submitted", "schedule_verified", "published", "verified"].includes(event.event_type)) return false;
+      if (!["schedule_submitted", "schedule_rescheduled", "schedule_verified", "published", "verified"].includes(event.event_type)) return false;
       if (event.text_sha256 !== chapter.text_sha256) return false;
       const payload = event.payload || {};
       if (payload.publication_date && payload.publication_date !== row.publicationDate) return false;
@@ -939,6 +1051,71 @@ async function inspectPlatform(bookId, chapterNos) {
   return { snapshot, observations, recordObservations, recorded };
 }
 
+async function rescheduleChapter(bookId, chapterNo, publicationDate, publicationTime) {
+  if (!bookId || !Number.isInteger(chapterNo) || chapterNo < 1) {
+    throw automationFailure("修改定时缺少有效作品或章节号。", "reschedule_target_invalid");
+  }
+  const chapter = await getChapter(bookId, chapterNo);
+  const currentVersionVerified = [...(chapter.events || [])].reverse().some((event) => (
+    event.text_sha256 === chapter.text_sha256 &&
+    ["schedule_submitted", "schedule_verified", "published", "verified"].includes(event.event_type)
+  ));
+  if (!currentVersionVerified) {
+    throw automationFailure(
+      "本章平台正文版本尚未核对，拒绝修改定时。",
+      "reschedule_version_unverified"
+    );
+  }
+
+  const books = await apiRequest("/api/v1/books");
+  const expectedBook = (books.books || []).find((entry) => entry.book_id === bookId);
+  if (!expectedBook) throw automationFailure("本地账本中没有找到目标作品。", "book_not_found");
+  const expectedWorkId = await resolvePlatformWorkId(bookId, expectedBook);
+  const tab = await ensureChapterManagementTab(expectedWorkId);
+  const changed = await sendPageAction(tab.id, {
+    type: "reschedulePublication",
+    options: {
+      chapterNo,
+      title: chapter.platform_title || chapter.title,
+      publicationDate,
+      publicationTime
+    }
+  });
+  if (!changed?.ok) {
+    throw automationFailure(
+      changed?.error || "修改定时失败。",
+      changed?.code || "reschedule_failed",
+      changed
+    );
+  }
+
+  const quotaUnits = countVisibleCharacters(chapter.body);
+  await postEvent(bookId, chapterNo, "schedule_rescheduled", chapter.text_sha256, {
+    publication_date: publicationDate,
+    publication_time: publicationTime,
+    previous_publication_date: changed.previousPublicationDate || null,
+    previous_publication_time: changed.previousPublicationTime || null,
+    quota_units: quotaUnits,
+    platform_state: "scheduled",
+    version_verified: true,
+    evidence: changed.evidence || null,
+    page_url: changed.url || tab.url
+  });
+
+  const readback = await inspectPlatform(bookId, [chapterNo]);
+  const row = (readback.snapshot?.rows || []).find((item) => Number(item.chapterNo) === chapterNo);
+  const observation = (readback.observations || []).find((item) => Number(item.chapter_no) === chapterNo);
+  if (!row?.found || !row.scheduled || row.publicationDate !== publicationDate ||
+      row.publicationTime !== publicationTime || !observation?.version_verified) {
+    throw automationFailure(
+      "修改定时后平台回读不一致，已停止。",
+      "reschedule_readback_mismatch",
+      { row, observation, changed }
+    );
+  }
+  return { changed, row, observation };
+}
+
 async function getChapter(bookId, chapterNo) {
   return apiRequest(`/api/v1/books/${encodeURIComponent(bookId)}/chapters/${chapterNo}`);
 }
@@ -947,6 +1124,7 @@ function chapterPayload(chapter) {
   return {
     chapter_no: chapter.chapter_no,
     title: chapter.title,
+    platform_title: chapter.platform_title || null,
     body: chapter.body,
     text_sha256: chapter.text_sha256,
     char_count: chapter.char_count
@@ -971,6 +1149,159 @@ async function markBlocked(bookId, chapterNo, planId, textSha256, code, details)
   } catch (_error) { /* preserve original stop reason */ }
 }
 
+// 自动补传：对“平台已有但我们自己未提交的草稿”章节，打开其已有编辑器、填入本地内容并提交，
+// 而不是卡在人工确认。安全边界见 canAutoSupplement 的判断——已发布/定时态不自动覆盖。
+function canAutoSupplement(chapter) {
+  return (
+    chapter.platform_state === "draft_unverified" ||
+    chapter.platform_state === "saved_draft" ||
+    chapter.status === "legacy_draft"
+  );
+}
+
+async function autoSupplementChapter(bookId, chapterNo, planId) {
+  if (automationLock) throw new Error("已有自动发布任务正在运行。");
+  automationLock = true;
+  let activeChapter = null;
+  let pageMutationStarted = false;
+  let finalSubmissionArmed = false;
+  try {
+    if (!planId) throw new Error("自动补传必须绑定已批准的发布计划。");
+    const [chapter, plan] = await Promise.all([
+      getChapter(bookId, chapterNo),
+      apiRequest(`/api/v1/publication-plans/${encodeURIComponent(planId)}`)
+    ]);
+    activeChapter = chapter;
+    const bookCatalog = await apiRequest("/api/v1/books");
+    const expectedBook = (bookCatalog.books || []).find((entry) => entry.book_id === bookId);
+    if (!expectedBook) throw new Error("本地账本中没有找到目标作品。");
+    let expectedWorkId = await platformWorkIdForBook(bookId);
+    if (!expectedWorkId) expectedWorkId = await resolvePlatformWorkId(bookId, expectedBook);
+    if (plan.status !== "approved") throw new Error(`发布计划状态 ${plan.status} 不允许执行。`);
+    const item = (plan.items || []).find((entry) => Number(entry.chapter_no) === chapterNo);
+    if (!item) throw new Error("发布计划中没有目标章节。");
+
+    // 安全边界：只对我们自己的未提交草稿自动补传；平台已是定时/发布态的保留人工确认。
+    if (!canAutoSupplement(chapter)) {
+      throw automationFailure(
+        `第 ${chapterNo} 章平台已是定时/发布态，需人工核对后再补传，已停止以免覆盖。`,
+        "platform_state_requires_reconciliation",
+        { chapterStatus: chapter.status, platformState: chapter.platform_state }
+      );
+    }
+
+    const tab = await ensureChapterManagementTab(expectedWorkId);
+    const opened = await sendPageAction(tab.id, { type: "openExistingChapter", chapterNo, workId: expectedWorkId });
+    await clearPlatformPreflight(bookId);
+    if (!opened?.ok) {
+      throw automationFailure(opened?.error || "打开已有章节编辑器失败。", opened?.code || "open_existing_failed", opened);
+    }
+    pageMutationStarted = true;
+    const editorTab = tab;
+
+    // 校验确实打开了正确的章节，避免覆盖错误章节。
+    const existing = await sendPageAction(editorTab.id, { type: "inspectChapter", chapter: chapterPayload(chapter) });
+    if (!existing?.ok || !existing.titleMatches || !existing.chapterMatches) {
+      throw automationFailure(
+        "打开的编辑器不是目标章节的完整内容，已停止且不会覆盖。",
+        "supplement_chapter_mismatch",
+        existing
+      );
+    }
+
+    await safePostEvent(bookId, chapterNo, "automation_started", chapter.text_sha256, {
+      plan_id: planId, page_url: editorTab.url, publication_date: item.publication_date,
+      publication_time: item.publication_time, quota_units: item.quota_units, supplement: true
+    });
+
+    pageMutationStarted = true;
+    const filled = await sendPageAction(editorTab.id, { type: "fillChapter", chapter: chapterPayload(chapter) });
+    if (!filled?.ok) throw automationFailure(filled?.error || "自动填充失败。", filled?.code || "fill_failed", filled);
+    await safePostEvent(bookId, chapterNo, "filled", chapter.text_sha256, {
+      plan_id: planId, page_url: filled.url || editorTab.url,
+      platform_draft_id: filled.draftId || null, observed_char_count: filled.observedCharCount,
+      content_stability_ms: filled.contentStabilityMs || null, refilled_after_editor_remount: Boolean(filled.refilledAfterRemount)
+    });
+
+    const next = await sendPageAction(editorTab.id, { type: "clickNext", chapter: chapterPayload(chapter) });
+    if (!next?.ok) throw automationFailure(next?.error || "点击下一步前校验失败。", next?.code || "next_failed", next);
+    await safePostEvent(bookId, chapterNo, "next_clicked", chapter.text_sha256, {
+      plan_id: planId, selected_button: next.selected || null,
+      page_url_before: next.transition?.before?.url || editorTab.url,
+      page_url_after: next.transition?.after?.url || null,
+      editor_present_after: next.transition?.after?.editor?.present ?? null
+    });
+
+    const postNextTab = await chrome.tabs.get(editorTab.id);
+    const resolvedAiPolicy = await resolveAiPolicy(bookId, plan.ai_policy);
+    const publication = await sendPageAction(postNextTab.id, {
+      type: "completePublicationFlow",
+      options: {
+        publicationDate: item.publication_date,
+        publicationTime: item.publication_time,
+        aiPolicy: resolvedAiPolicy,
+        chapterNo,
+        title: chapter.platform_title || chapter.title,
+        deferFinalSubmit: true,
+        nextTransition: next.transition || null
+      }
+    });
+    if (publication?.paused && publication?.code === "ai_choice_required") {
+      await safePostEvent(bookId, chapterNo, "awaiting_ai_choice", chapter.text_sha256, {
+        plan_id: planId, publication_date: item.publication_date, publication_time: item.publication_time,
+        quota_units: item.quota_units, page_url: postNextTab.url
+      });
+      return { ok: true, paused: true, code: "ai_choice_required", chapterNo, message: publication.error, pageUrl: postNextTab.url };
+    }
+    if (!publication?.ok) {
+      throw automationFailure(publication?.error || "发布流程未完成。", publication?.code || "publication_flow_failed", publication);
+    }
+    const submitOptions = {
+      publicationDate: publication.publicationDate || item.publication_date,
+      publicationTime: publication.publicationTime || item.publication_time,
+      aiPolicy: resolvedAiPolicy,
+      chapterNo,
+      title: chapter.platform_title || chapter.title
+    };
+    await safePostEvent(bookId, chapterNo, "final_submit_armed", chapter.text_sha256, {
+      plan_id: planId, platform_state: "submitted_unverified",
+      publication_date: submitOptions.publicationDate, publication_time: submitOptions.publicationTime,
+      quota_units: item.quota_units, page_url: postNextTab.url
+    });
+    finalSubmissionArmed = true;
+    let submitted = null;
+    try {
+      submitted = await sendPageAction(postNextTab.id, { type: "submitPreparedPublication", options: submitOptions });
+    } catch (error) {
+      submitted = {
+        ok: true, code: "final_submit_response_lost", finalSubmitAttempted: true, responseLost: true,
+        error: normalizeError(error), publicationDate: submitOptions.publicationDate,
+        publicationTime: submitOptions.publicationTime, aiPolicy: submitOptions.aiPolicy
+      };
+    }
+    const rejectionError = await recordExplicitSubmissionRejection(bookId, chapter, planId, item, postNextTab, submitted);
+    if (rejectionError) { finalSubmissionArmed = false; throw rejectionError; }
+    if (!submitted?.ok && !submitted?.finalSubmitAttempted) {
+      throw automationFailure(submitted?.error || "最终提交前校验失败。", submitted?.code || "submission_unverified", submitted);
+    }
+    return await submitAndVerifyPublication(bookId, chapter, plan, item, postNextTab, submitted, expectedWorkId);
+  } catch (error) {
+    if (activeChapter && pageMutationStarted) {
+      await markBlocked(bookId, chapterNo, planId, activeChapter.text_sha256, error.code || "automation_blocked", {
+        message: normalizeError(error), details: error.details || null, finalSubmissionArmed, supplement: true
+      });
+    } else if (activeChapter) {
+      await safePostEvent(bookId, chapterNo, "failed", activeChapter.text_sha256, {
+        plan_id: planId, error: error.code || normalizeError(error), message: normalizeError(error),
+        stage: "pre_mutation_check", details: error.details || null
+      });
+    }
+    throw error;
+  } finally {
+    automationLock = false;
+  }
+}
+
 async function reconcileChapter(bookId, chapterNo) {
   const chapter = await getChapter(bookId, chapterNo);
   const platformObservation = [...(chapter.events || [])].reverse().find((event) =>
@@ -990,7 +1321,7 @@ async function reconcileChapter(bookId, chapterNo) {
   const tab = await currentFanqieTab();
   const response = await sendPageAction(tab.id, {
     type: "inspectChapter",
-    chapter: { chapter_no: chapter.chapter_no, title: chapter.title, body: chapter.body, text_sha256: chapter.text_sha256 }
+    chapter: chapterPayload(chapter)
   });
   if (!response?.ok) throw new Error(response?.error || "草稿读取失败。");
   const matched = response.titleMatches && response.bodyMatches && response.chapterMatches;
@@ -1090,9 +1421,14 @@ function countVisibleCharacters(value) {
 async function resolveAiPolicy(bookId, planPolicy) {
   const policy = String(planPolicy || "remember");
   if (policy !== "remember") return policy;
-  const stored = await chrome.storage.local.get({ aiChoiceByBook: {} });
+  const stored = await chrome.storage.local.get({ aiChoiceByBook: {}, lastAiChoice: null });
   const remembered = stored.aiChoiceByBook?.[bookId];
-  return ["use", "no"].includes(remembered) ? remembered : "remember";
+  if (["use", "no"].includes(remembered)) return remembered;
+  // 本书没有记录时，沿用全局上一次选择，避免“发布设置中的 AI 选项没有明确选择”卡住。
+  const last = stored.lastAiChoice;
+  if (["use", "no"].includes(last)) return last;
+  // 完全没有任何历史记录时仍返回 remember，交由页面逻辑安全兜底（见 content-script 的 configureAiPolicy）。
+  return "remember";
 }
 
 async function rememberAiChoice(bookId, observedChoice) {
@@ -1101,9 +1437,11 @@ async function rememberAiChoice(bookId, observedChoice) {
   if (/不使用AI|未使用AI/iu.test(text) || text === "否" || /否$/u.test(text)) normalized = "no";
   else if (/使用AI/iu.test(text) || text === "是" || /是$/u.test(text)) normalized = "use";
   if (!normalized) return;
-  const stored = await chrome.storage.local.get({ aiChoiceByBook: {} });
+  const stored = await chrome.storage.local.get({ aiChoiceByBook: {}, lastAiChoice: null });
   await chrome.storage.local.set({
-    aiChoiceByBook: { ...(stored.aiChoiceByBook || {}), [bookId]: normalized }
+    aiChoiceByBook: { ...(stored.aiChoiceByBook || {}), [bookId]: normalized },
+    // 跨书记忆：以后其它作品也能沿用上一次 AI 声明，减少中断。
+    lastAiChoice: normalized
   });
 }
 

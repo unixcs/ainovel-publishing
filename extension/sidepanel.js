@@ -320,9 +320,14 @@ async function smartProcessSelected() {
     }
     return;
   }
-  const needsReconciliation = chapter.status === "legacy_draft" || ["scheduled_unverified", "published_unverified", "draft_unverified"].includes(chapter.platform_state);
+  const needsReconciliation = chapter.status === "legacy_draft" || ["scheduled_unverified", "published_unverified", "draft_unverified", "saved_draft"].includes(chapter.platform_state);
   if (needsReconciliation) {
-    await reconcileSelected();
+    // 安全态（我们自己未提交的草稿）直接自动补传；平台已发布/定时态保留人工核对。
+    if (isSafeSupplement(chapter)) {
+      await supplementSelected();
+    } else {
+      await reconcileSelected();
+    }
     return;
   }
   if (["scheduled", "published", "verified", "legacy_published"].includes(chapter.status) || ["scheduled", "published"].includes(chapter.platform_state)) {
@@ -352,6 +357,19 @@ async function prepareAndRun(chapterNo) {
         targetChapterNo: chapterNo,
         platformSnapshot: state.platformSnapshot
       });
+      return;
+    }
+    // 安全态的平台未核对记录：直接自动补传，不再卡在人工确认。
+    if (detail.ok && isSafeSupplement(detail.result)) {
+      const approved = await send({ type: "approvePlan", planId: plan.plan_id });
+      if (!approved.ok) {
+        setActionResult(friendlyError(approved.error), "danger");
+        primaryButton.disabled = false;
+        return;
+      }
+      state.currentPlan = approved.result;
+      await runSupplement(blocker.chapter_no, plan.plan_id);
+      primaryButton.disabled = false;
       return;
     }
     const instruction = blockerInstruction(blocker);
@@ -497,6 +515,53 @@ async function reconcileSelected() {
   }
 }
 
+// 安全态：平台已有但我们自己未提交的草稿（draft_unverified / saved_draft / legacy_draft）。
+// 这类可自动补传；已发布/定时态不在此列，需人工核对，避免覆盖用户手动修改。
+function isSafeSupplement(chapter) {
+  return (
+    chapter.platform_state === "draft_unverified" ||
+    chapter.platform_state === "saved_draft" ||
+    chapter.status === "legacy_draft"
+  );
+}
+
+async function supplementSelected() {
+  if (!state.selected) return;
+  setStatus("正在自动补传当前章节…", "打开已有编辑器、填入本地内容并提交，不会新建重复章节。", "neutral");
+  const plan = await requestPlan({ announce: false });
+  if (!plan) return;
+  const approved = await send({ type: "approvePlan", planId: plan.plan_id });
+  if (!approved.ok) {
+    setActionResult(friendlyError(approved.error), "danger");
+    return setStatus("排程无法执行", friendlyError(approved.error), "danger");
+  }
+  state.currentPlan = approved.result;
+  await runSupplement(state.selected.chapter_no, plan.plan_id);
+}
+
+async function runSupplement(chapterNo, planId) {
+  const response = await send({
+    type: "autoSupplementChapter",
+    bookId: $("bookSelect").value,
+    chapterNo,
+    planId
+  });
+  if (!response.ok) {
+    await connectAndLoad();
+    setActionResult(`自动补传已停止：${response.error}`, "danger");
+    return setStatus("自动补传已停止", "状态已重新读取；可直接重试主按钮。", "danger");
+  }
+  if (response.paused) {
+    $("statusFilter").value = "awaiting_ai_choice";
+    await connectAndLoad();
+    setActionResult("发布流程已停在 AI 声明处：请在番茄页面手动选择，然后回到插件继续。", "warn");
+    return setStatus("等待你选择 AI", "选择完成后点击“我已手动选择 AI，继续发布”。", "warn");
+  }
+  setActionResult(`第 ${chapterNo} 章已自动补传并完成平台状态验证。`, "ok");
+  setStatus("自动补传成功", "该章节已由插件接管。", "ok");
+  await connectAndLoad();
+}
+
 function currentPlanItem(chapterNo) { return state.currentPlan?.items?.find((item) => Number(item.chapter_no) === Number(chapterNo)); }
 function localDateString() { const date = new Date(); const offset = date.getTimezoneOffset(); return new Date(date.getTime() - offset * 60_000).toISOString().slice(0, 10); }
 function setActionResult(message, kind) { const element = $("actionResult"); element.textContent = message; element.className = `action-result ${kind || "neutral"}`; element.scrollIntoView({ behavior: "smooth", block: "nearest" }); }
@@ -550,7 +615,10 @@ function platformStateLabel(value) {
 }
 
 function primaryActionForChapter(chapter) {
-  if (chapter.status === "legacy_draft" || ["scheduled_unverified", "published_unverified", "draft_unverified"].includes(chapter.platform_state)) {
+  if (isSafeSupplement(chapter)) {
+    return { label: "自动补传本章", disabled: false };
+  }
+  if (["scheduled_unverified", "published_unverified"].includes(chapter.platform_state)) {
     return { label: "核对当前番茄章节", disabled: false };
   }
   if (["scheduled", "published", "verified", "legacy_published"].includes(chapter.status) || ["scheduled", "published"].includes(chapter.platform_state)) {

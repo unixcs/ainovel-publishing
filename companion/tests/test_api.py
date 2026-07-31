@@ -61,11 +61,11 @@ def test_publication_plan_api_and_platform_observation(tmp_path: Path):
     response = client.post(
         f"/api/v1/books/{row['book_id']}/publication-plans",
         headers=headers,
-        json={"slot": "20:00", "daily_limit": 9999, "ai_policy": "remember", "start_date": "2026-07-23"},
+        json={"slot": "20:00", "daily_limit": 9999, "ai_policy": "remember", "start_date": "2026-07-24"},
     )
     assert response.status_code == 200
     plan = response.json()
-    assert plan["items"][0]["publication_date"] == "2026-07-23"
+    assert plan["items"][0]["publication_date"] == "2026-07-24"
     approved = client.post(f"/api/v1/publication-plans/{plan['plan_id']}/approve", headers=headers)
     assert approved.status_code == 200
     observed = client.post(
@@ -74,7 +74,7 @@ def test_publication_plan_api_and_platform_observation(tmp_path: Path):
         json={"observations": [{
             "chapter_no": 6,
             "text_sha256": "6" * 64,
-            "publication_date": "2026-07-23",
+            "publication_date": "2026-07-24",
             "publication_time": "20:00",
             "quota_units": 6,
             "version_verified": True,

@@ -45,7 +45,7 @@ def test_simplified_sidepanel_renders_user_labels_without_internal_block_codes()
               sendMessage(payload, callback) {
                 const responses = {
                   getSettings: {baseUrl:'http://127.0.0.1:8787',apiToken:'token',selectedSlot:'20:00',aiPolicy:'remember',automationEnabled:false},
-                  health: {ok:true,version:'0.3.4'},
+                  health: {ok:true,version:'0.3.7'},
                   getPublicationSettings: {daily_limit:9999,slots:['12:00','20:00','22:00'],default_slot:'20:00'},
                   getBooks: {books:[{book_id:'book',name:'示例小说',ready_count:1}]},
                   getChapters: {chapters:[{book_id:'book',chapter_no:6,title:'第六章 夜话',status:'filled',platform_state:null,version:1,char_count:3965,text_sha256:'aaaaaaaaaaaaaaa'}]},
@@ -100,7 +100,7 @@ def test_recoverable_blocked_chapter_has_one_clickable_primary_recovery_action()
               sendMessage(payload, callback) {
                 const responses = {
                   getSettings: {baseUrl:'http://127.0.0.1:8787',apiToken:'token',selectedSlot:'20:00',aiPolicy:'remember',automationEnabled:false},
-                  health: {ok:true,version:'0.3.4'},
+                  health: {ok:true,version:'0.3.7'},
                   getPublicationSettings: {daily_limit:9999,slots:['12:00','20:00','22:00'],default_slot:'20:00'},
                   getBooks: {books:[{book_id:'book',name:'示例小说',ready_count:0}]},
                   getChapters: {chapters:[CHAPTER]},
@@ -168,7 +168,7 @@ def test_background_canonical_navigation_binds_dynamic_work_and_reuses_preflight
                 },
                 async reload(id) {
                   const tab=window.__tabs.find(item => item.id === Number(id)); tab.status='complete';
-                  window.__adapterVersion='0.3.4'; window.__reloadCount += 1;
+                  window.__adapterVersion='0.3.7'; window.__reloadCount += 1;
                 },
                 async create(changes) { const tab={id:99,status:'complete',...changes}; window.__tabs.push(tab); return {...tab}; },
                 async sendMessage(_id, message) {
@@ -274,3 +274,65 @@ def test_extension_sends_exact_bundle_version_on_every_local_api_request():
     block = source[start:end]
     assert '"X-Ainovel-Client-Version": PAGE_ADAPTER_VERSION' in block
     assert 'headers["X-Ainovel-Token"] = apiToken' in block
+
+
+def test_final_navigation_response_loss_is_resolved_by_management_list_readback():
+    source = (ROOT / "background.js").read_text(encoding="utf-8")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("<html><body></body></html>")
+        page.evaluate(
+            """() => {
+              window.__gets = 0;
+              window.chrome = {
+                runtime: {
+                  onInstalled: {addListener() {}}, onStartup: {addListener() {}},
+                  onMessage: {addListener() {}}, lastError: null
+                },
+                alarms: {onAlarm: {addListener() {}}, create: async () => {}},
+                sidePanel: {setPanelBehavior: async () => {}},
+                storage: {local: {
+                  async get(defaults) { return {...defaults}; }, async set() {}
+                }},
+                tabs: {
+                  async get(id) {
+                    window.__gets += 1;
+                    return {
+                      id, status:'complete',
+                      url: window.__gets < 3
+                        ? 'https://fanqienovel.com/main/writer/7664986207666850841/publish/7665652129381483032'
+                        : 'https://fanqienovel.com/main/writer/chapter-manage/7664986207666850841?type=1'
+                    };
+                  },
+                  async sendMessage(_id, message) {
+                    if (message.type !== 'inspectPublicationList') throw new Error('unexpected action');
+                    return {
+                      ok:true, listStable:true,
+                      rows:[{chapterNo:8,found:true,reviewing:true,scheduled:true,published:false,
+                             publicationDate:'2026-07-25',publicationTime:'20:00'}]
+                    };
+                  }
+                }
+              };
+            }"""
+        )
+        page.add_script_tag(content=source)
+        result = page.evaluate(
+            """() => waitForSubmissionReadback(17, '7664986207666850841', 8, 5000)"""
+        )
+        assert result["ok"] is True
+        assert result["listStable"] is True
+        assert result["rows"][0]["reviewing"] is True
+        assert page.evaluate("window.__gets") >= 3
+        browser.close()
+
+
+def test_background_records_explicit_platform_rejection_before_any_readback_claim():
+    source = (ROOT / "background.js").read_text(encoding="utf-8")
+    helper = source[source.index("async function recordExplicitSubmissionRejection"):source.index("async function submitAndVerifyPublication")]
+    assert '"submission_rejected"' in helper
+    assert 'platform_state: "draft_rejected"' in helper
+    assert '"platform_submission_rejected"' in helper
+    automation = source[source.index("async function automateChapter("):source.index("async function continueManualAi(")]
+    assert automation.index("recordExplicitSubmissionRejection") < automation.index("submitAndVerifyPublication")

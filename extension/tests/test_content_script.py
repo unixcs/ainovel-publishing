@@ -42,6 +42,26 @@ def test_blank_editor_fills_and_validates():
         browser.close()
 
 
+def test_blank_editor_uses_stable_platform_title_for_later_duplicate():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content(page_html())
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke(page, {
+            "chapter_no": 35,
+            "title": "第三十五章 晨钟",
+            "platform_title": "晨钟（二）",
+            "body": "正文内容",
+            "text_sha256": "3" * 64,
+            "char_count": 4,
+        })
+        assert result["ok"] is True
+        assert page.locator(".serial-input").input_value() == "35"
+        assert page.locator(".serial-editor-input-hint-area").input_value() == "晨钟（二）"
+        browser.close()
+
+
 def test_existing_other_title_fails_without_overwrite():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
@@ -252,6 +272,311 @@ def publication_flow_html() -> str:
     """
 
 
+def arco_publication_flow_html() -> str:
+    """A close DOM model of the current Fanqie/Arco modal sequence in live screenshots."""
+    return """
+    <!doctype html><html><head><style>
+      .arco-modal-wrapper { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+      .arco-modal { width:520px; min-height:240px; background:white; padding:20px; }
+      .arco-modal-content { min-height:80px; }
+      .arco-modal-footer { display:flex; justify-content:flex-end; gap:16px; }
+      button,.arco-radio,.setting-row,input { min-width:60px; min-height:28px; }
+      .setting-row { padding:10px; }
+      input[type=radio] { position:absolute; opacity:0; width:1px; height:1px; }
+      .arco-picker-container,.arco-timepicker-container { min-width:260px; min-height:120px; padding:8px; }
+      .arco-picker-cell,.arco-timepicker-cell { display:inline-block; min-width:24px; min-height:24px; padding:2px; }
+      .arco-timepicker-list { display:inline-block; width:90px; max-height:220px; overflow:auto; vertical-align:top; }
+    </style></head><body>
+      <input class="serial-input" value="">
+      <input class="serial-editor-input-hint-area" value="">
+      <div class="ProseMirror" contenteditable="true" style="width:800px;height:500px"></div>
+      <button id="outside-submit">提交</button>
+      <button id="next" style="position:fixed;top:20px;right:20px">下一步</button>
+      <script>
+        window.chrome = {runtime: {onMessage: {addListener(fn) { window.__ainovelListener = fn; }}}};
+        window.__flow = [];
+        window.__chapterNo = 8;
+        window.__previousChapterNo = 7;
+        window.__submitted = [];
+        window.__pickerFlow = [];
+        document.getElementById('outside-submit').onclick = () => window.__flow.push('outside-submit');
+
+        function typoModal() {
+          document.body.insertAdjacentHTML('beforeend', `
+            <div class="arco-modal-wrapper" id="typo-wrapper">
+              <div class="arco-modal" id="typo-modal">
+                <div class="arco-modal-header"><div class="arco-modal-title">发布提示</div></div>
+                <div class="arco-modal-content">检测到你还有错别字未修改，是否确定提交？</div>
+                <div class="arco-modal-footer">
+                  <button class="arco-btn">取消</button>
+                  <button id="typo-real-submit" class="arco-btn arco-btn-primary">提交</button>
+                </div>
+              </div>
+            </div>`);
+          document.getElementById('typo-real-submit').onclick = () => {
+            window.__flow.push('typo-submit');
+            document.getElementById('typo-wrapper').remove();
+            setTimeout(detectionModal, 250);
+          };
+        }
+
+        function detectionModal() {
+          document.body.insertAdjacentHTML('beforeend', `
+            <div class="arco-modal-wrapper" id="detection-wrapper">
+              <div class="arco-modal" id="detection-modal">
+                <div class="arco-modal-header"><div class="arco-modal-title">请选择内容检测方式</div></div>
+                <div class="arco-modal-content">
+                  <p>全面检测（本章节剩余次数：2/2次）</p>
+                  <p>将对章节内容进行深度排查，标注当前章节可能存在的风险內容，辅助提升内容通过效率；</p>
+                  <p>基础检测（不限次数）</p>
+                  <p>使用平台常规功能排查特定范围的违规内容，不覆盖范围外的检测。</p>
+                </div>
+                <div class="arco-modal-footer">
+                  <button id="basic-check" class="arco-btn">仅基础检测</button>
+                  <button id="full-check-real" class="arco-btn arco-btn-primary">全面检测</button>
+                </div>
+              </div>
+            </div>`);
+          document.getElementById('basic-check').onclick = () => window.__flow.push('basic-check');
+          document.getElementById('full-check-real').onclick = () => {
+            window.__flow.push('full-check');
+            document.getElementById('full-check-real').disabled = true;
+            setTimeout(() => {
+              document.getElementById('detection-wrapper').remove();
+              settingsModal();
+            }, 650);
+          };
+        }
+
+        function settingsModal() {
+          document.body.insertAdjacentHTML('beforeend', `
+            <div class="arco-modal-wrapper" id="settings-wrapper">
+              <div class="arco-modal" id="publish-settings-live">
+                <div class="arco-modal-header"><div class="arco-modal-title">发布设置</div></div>
+                <div class="arco-modal-content">
+                  <div class="chapter-context">
+                    <div>分卷　第一卷：默认</div>
+                    <div>章节　第${window.__chapterNo}章 测试标题</div>
+                    <div>上次提交　第一卷 第${window.__previousChapterNo}章 上一章</div>
+                  </div>
+                  <div class="setting-row ai-row">
+                    <span>是否使用AI</span>
+                    <label class="arco-radio"><input name="ai" type="radio" value="yes"><span>是</span></label>
+                    <label class="arco-radio"><input name="ai" type="radio" value="no"><span>否</span></label>
+                  </div>
+                  <div class="setting-row schedule-row">
+                    <span>定时发布</span>
+                    <button id="schedule-switch" class="arco-switch" role="switch" aria-checked="false"></button>
+                    <span>关闭定时发布后，章节在通过审核后会立即发布</span>
+                    <div id="schedule-fields"></div>
+                  </div>
+                </div>
+                <div class="arco-modal-footer">
+                  <button class="arco-btn">取消</button>
+                  <button id="confirm-publish" class="arco-btn arco-btn-primary">确认发布</button>
+                </div>
+              </div>
+            </div>`);
+          window.__committedDate = '2026-07-23';
+          window.__committedTime = '21:00';
+          document.getElementById('schedule-switch').onclick = () => {
+            const control = document.getElementById('schedule-switch');
+            const on = control.getAttribute('aria-checked') !== 'true';
+            control.setAttribute('aria-checked', String(on));
+            control.classList.toggle('arco-switch-checked', on);
+            if (on) setTimeout(() => {
+              document.getElementById('schedule-fields').innerHTML = `
+                <div class="setting-row date-row"><span>日期</span><div class="arco-picker"><input placeholder="请选择日期" class="arco-picker-start-time publish-date" type="text" value="2026-07-23"></div></div>
+                <div class="setting-row time-row"><span>时间</span><div class="arco-picker"><input placeholder="请选择时间" class="arco-picker-start-time publish-time" type="text" value="21:00"></div></div>`;
+              const dateInput = document.querySelector('.publish-date');
+              const timeInput = document.querySelector('.publish-time');
+              dateInput.onclick = () => {
+                document.querySelector('.arco-picker-container')?.remove();
+                dateInput.closest('.date-row').insertAdjacentHTML('beforeend', `
+                  <div class="arco-picker-container">
+                    <div class="arco-picker-header-value"><span class="arco-picker-header-label">2026年</span><span class="arco-picker-header-label">7月</span></div>
+                    <div class="arco-picker-body">${[23,24,25,26,27,28,29,30,31].map(day => `<div class="arco-picker-cell arco-picker-cell-in-view"><div class="arco-picker-date"><div class="arco-picker-date-value">${day}</div></div></div>`).join('')}</div>
+                  </div>`);
+                document.querySelectorAll('.arco-picker-cell-in-view').forEach(cell => {
+                  cell.onclick = () => {
+                    const day = cell.querySelector('.arco-picker-date-value').textContent.padStart(2, '0');
+                    window.__committedDate = `2026-07-${day}`;
+                    dateInput.value = window.__committedDate;
+                    window.__pickerFlow.push('date-cell');
+                    document.querySelector('.arco-picker-container').remove();
+                  };
+                });
+              };
+              timeInput.onclick = () => {
+                document.querySelector('.arco-timepicker-container')?.remove();
+                const hours = Array.from({length:24}, (_, value) => String(value).padStart(2, '0'));
+                const minutes = Array.from({length:60}, (_, value) => String(value).padStart(2, '0'));
+                const [selectedHour, selectedMinute] = window.__committedTime.split(':');
+                timeInput.closest('.time-row').insertAdjacentHTML('beforeend', `
+                  <div class="arco-timepicker-container">
+                    <div class="arco-timepicker-list"><ul>${hours.map(value => `<li data-value="${value}" class="arco-timepicker-cell ${value === selectedHour ? 'arco-timepicker-cell-selected' : ''}"><div class="arco-timepicker-cell-inner">${value}</div></li>`).join('')}</ul></div>
+                    <div class="arco-timepicker-list"><ul>${minutes.map(value => `<li data-value="${value}" class="arco-timepicker-cell ${value === selectedMinute ? 'arco-timepicker-cell-selected' : ''}"><div class="arco-timepicker-cell-inner">${value}</div></li>`).join('')}</ul></div>
+                    <div class="arco-timepicker-footer-btn-wrapper"><button class="arco-btn">此刻</button><button id="time-confirm" class="arco-btn arco-btn-primary">确定</button></div>
+                  </div>`);
+                const lists = document.querySelectorAll('.arco-timepicker-list');
+                lists.forEach(list => list.querySelectorAll('.arco-timepicker-cell').forEach(cell => {
+                  cell.onclick = () => {
+                    list.querySelector('.arco-timepicker-cell-selected')?.classList.remove('arco-timepicker-cell-selected');
+                    cell.classList.add('arco-timepicker-cell-selected');
+                  };
+                }));
+                document.getElementById('time-confirm').onclick = () => {
+                  const values = [...document.querySelectorAll('.arco-timepicker-list')].map(list => list.querySelector('.arco-timepicker-cell-selected').dataset.value);
+                  window.__committedTime = values.join(':');
+                  timeInput.value = window.__committedTime;
+                  window.__pickerFlow.push('time-confirm');
+                  document.querySelector('.arco-timepicker-container').remove();
+                };
+              };
+            }, 300);
+          };
+          document.getElementById('confirm-publish').onclick = () => {
+            const yes = document.querySelector("input[name='ai'][value='yes']").checked;
+            const scheduled = document.getElementById('schedule-switch').getAttribute('aria-checked') === 'true';
+            const date = window.__committedDate || '';
+            const time = window.__committedTime || '';
+            window.__submitted.push({chapterNo:window.__chapterNo, yes, scheduled, date, time});
+            window.__flow.push('confirm-publish');
+            document.getElementById('settings-wrapper').remove();
+            document.body.insertAdjacentHTML('beforeend', `<div role="status">已提交，预计1小时内完成审核</div>
+              <main><h1>章节管理</h1><button>新建章节</button>
+              <div class="chapter-row">第${window.__chapterNo}章 测试标题　审核中　${date} ${time}</div></main>`);
+          };
+        }
+
+        document.getElementById('next').onclick = typoModal;
+      </script>
+    </body></html>
+    """
+
+
+def test_live_arco_modal_sequence_uses_footer_submit_full_check_ai_schedule_and_success_toast():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width": 1365, "height": 900})
+        page.set_content(arco_publication_flow_html())
+        page.add_script_tag(path=str(SCRIPT))
+        chapter = {"chapter_no": 8, "title": "第八章 测试标题", "body": "第一段。\n\n第二段。", "text_sha256": "8" * 64, "char_count": 8}
+        assert invoke_action(page, {"type": "fillChapter", "chapter": chapter})["ok"] is True
+        assert invoke_action(page, {"type": "clickNext", "chapter": chapter})["ok"] is True
+        prepared = invoke_action(page, {
+            "type": "completePublicationFlow",
+            "options": {
+                "chapterNo": 8, "publicationDate": "2026-07-25",
+                "publicationTime": "20:00", "aiPolicy": "use", "deferFinalSubmit": True,
+            },
+        })
+        assert prepared["ok"] is True
+        assert prepared["code"] == "publication_ready"
+        assert page.evaluate("window.__flow") == ["typo-submit", "full-check"]
+        assert page.locator("input[name='ai'][value='yes']").is_checked()
+        assert page.locator("#schedule-switch").get_attribute("aria-checked") == "true"
+        assert page.locator(".publish-date").input_value() == "2026-07-25"
+        assert page.locator(".publish-time").input_value() == "20:00"
+        assert page.evaluate("window.__pickerFlow") == ["date-cell", "time-confirm"]
+        assert page.locator(".arco-picker-container:visible, .arco-timepicker-container:visible").count() == 0
+        assert page.evaluate("window.__submitted") == []
+
+        submitted = invoke_action(page, {
+            "type": "submitPreparedPublication",
+            "options": {
+                "chapterNo": 8, "publicationDate": "2026-07-25",
+                "publicationTime": "20:00", "aiPolicy": "use",
+            },
+        })
+        assert submitted["ok"] is True
+        assert submitted["code"] == "schedule_submitted"
+        assert page.evaluate("window.__flow") == ["typo-submit", "full-check", "confirm-publish"]
+        assert page.evaluate("window.__submitted") == [{
+            "chapterNo": 8, "yes": True, "scheduled": True,
+            "date": "2026-07-25", "time": "20:00",
+        }]
+        assert "已提交，预计1小时内完成审核" in page.locator("body").inner_text()
+        assert page.locator("#outside-submit").count() == 1
+        browser.close()
+
+
+def test_explicit_platform_rejection_is_returned_instead_of_ambiguous_timeout():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width": 1365, "height": 900})
+        page.set_content(arco_publication_flow_html())
+        page.add_script_tag(path=str(SCRIPT))
+        chapter = {
+            "chapter_no": 35, "title": "第三十五章 晨钟",
+            "platform_title": "晨钟（二）", "body": "正文内容",
+            "text_sha256": "3" * 64, "char_count": 4,
+        }
+        assert invoke_action(page, {"type": "fillChapter", "chapter": chapter})["ok"] is True
+        page.evaluate("window.__chapterNo=35; window.__previousChapterNo=34")
+        assert invoke_action(page, {"type": "clickNext", "chapter": chapter})["ok"] is True
+        options = {
+            # The reusable fixture renders “测试标题” inside its publication modal.
+            "chapterNo": 35, "title": "测试标题",
+            "publicationDate": "2026-07-25", "publicationTime": "20:00",
+            "aiPolicy": "use", "deferFinalSubmit": True,
+        }
+        prepared = invoke_action(page, {"type": "completePublicationFlow", "options": options})
+        assert prepared["ok"] is True, prepared
+        page.evaluate("""() => {
+          document.getElementById('confirm-publish').onclick = () => {
+            const toast = document.createElement('div');
+            toast.className = 'arco-message arco-message-error';
+            toast.setAttribute('role', 'alert');
+            toast.style.cssText = 'display:block;width:360px;height:40px';
+            toast.textContent = '本书中存在重复标题，请修改后再发布';
+            document.body.appendChild(toast);
+          };
+        }""")
+        submitted = invoke_action(page, {
+            "type": "submitPreparedPublication",
+            "options": {**options, "deferFinalSubmit": False},
+        })
+        assert submitted["ok"] is False
+        assert submitted["code"] == "platform_submission_rejected"
+        assert submitted["submissionRejected"] is True
+        assert submitted["finalSubmitAttempted"] is True
+        assert submitted["rejectionMessage"] == "本书中存在重复标题，请修改后再发布"
+        assert page.locator("#confirm-publish").count() == 1
+        browser.close()
+
+
+def test_same_full_flow_can_prepare_and_submit_three_consecutive_chapters():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        for chapter_no, publication_date in [(8, "2026-07-25"), (9, "2026-07-26"), (10, "2026-07-27")]:
+            page = browser.new_page(viewport={"width": 1365, "height": 900})
+            page.set_content(arco_publication_flow_html())
+            page.evaluate("args => { window.__chapterNo=args.n; window.__previousChapterNo=args.n-1; }", {"n": chapter_no})
+            page.add_script_tag(path=str(SCRIPT))
+            chapter = {
+                "chapter_no": chapter_no, "title": f"第{chapter_no}章 测试标题",
+                "body": f"第{chapter_no}章正文。", "text_sha256": str(chapter_no)[-1] * 64,
+                "char_count": 8,
+            }
+            assert invoke_action(page, {"type": "fillChapter", "chapter": chapter})["ok"] is True
+            assert invoke_action(page, {"type": "clickNext", "chapter": chapter})["ok"] is True
+            result = invoke_action(page, {
+                "type": "completePublicationFlow",
+                "options": {
+                    "chapterNo": chapter_no, "publicationDate": publication_date,
+                    "publicationTime": "20:00", "aiPolicy": "use",
+                },
+            })
+            assert result["ok"] is True
+            assert page.evaluate("window.__submitted[0]") == {
+                "chapterNo": chapter_no, "yes": True, "scheduled": True,
+                "date": publication_date, "time": "20:00",
+            }
+            page.close()
+        browser.close()
+
+
 def test_known_publication_flow_confirms_typo_check_ai_and_schedule():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
@@ -304,6 +629,51 @@ def test_manual_ai_policy_pauses_before_final_submission():
         browser.close()
 
 
+def test_publication_settings_waits_for_arco_modal_hydration_before_context_check():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content("""
+        <!doctype html><html><body>
+          <div role="dialog" id="publish-settings" style="width:520px;min-height:240px">
+            <h2>发布设置</h2>
+          </div>
+          <script>
+            window.chrome = {runtime: {onMessage: {addListener(fn) { window.__ainovelListener = fn; }}}};
+            setTimeout(() => {
+              const settings = document.getElementById('publish-settings');
+              settings.innerHTML = `
+                <h2>发布设置</h2>
+                <p>章节 第20章 追影</p>
+                <p>上次提交 第一卷 第19章 一卷空白</p>
+                <label>是否使用 AI <span id="ai-no" role="radio" aria-checked="false">否</span></label>
+                <label>发布方式 <span id="timing" role="radio" aria-checked="false">定时发布</span></label>
+                <label>发布日期 <input id="publish-date" type="date"></label>
+                <label>发布时间 <select id="publish-time"><option value="20:00">20:00</option></select></label>
+                <button id="confirm-publish">确认发布</button>`;
+              document.getElementById('ai-no').onclick = () => document.getElementById('ai-no').setAttribute('aria-checked', 'true');
+              document.getElementById('timing').onclick = () => document.getElementById('timing').setAttribute('aria-checked', 'true');
+              document.getElementById('confirm-publish').onclick = () => {
+                settings.insertAdjacentHTML('beforeend', '<p>已提交，预计1小时内完成审核</p>');
+              };
+            }, 300);
+          </script>
+        </body></html>
+        """)
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {
+            "type": "submitPreparedPublication",
+            "options": {
+                "chapterNo": 20, "publicationDate": "2026-08-06",
+                "publicationTime": "20:00", "aiPolicy": "no",
+            },
+        })
+        assert result["ok"] is True
+        assert result["code"] == "schedule_submitted"
+        assert "已提交" in page.locator("#publish-settings").inner_text()
+        browser.close()
+
+
 def test_publication_context_mismatch_blocks_before_schedule_submit():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
@@ -328,7 +698,7 @@ def test_unknown_risk_dialog_blocks_without_clicking_it():
         browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
         page = browser.new_page()
         page.set_content("""
-        <div role="dialog"><p>内容风险检测</p><button id="cancel">取消</button></div>
+        <div role="dialog"><p>安全验证：检测到操作频繁，请完成滑块验证</p><button id="cancel">取消</button></div>
         <script>window.chrome={runtime:{onMessage:{addListener(fn){window.__ainovelListener=fn}}}};</script>
         """)
         page.add_script_tag(path=str(SCRIPT))
@@ -339,6 +709,86 @@ def test_unknown_risk_dialog_blocks_without_clicking_it():
         assert result["ok"] is False
         assert result["code"] == "risk_control_detected"
         assert page.locator("#cancel").is_visible()
+        browser.close()
+
+
+def reschedule_flow_html() -> str:
+    return """
+    <!doctype html><html><head><style>
+      table { width: 900px; }
+      tr { height: 44px; }
+      .tomato-clock { display:inline-block; width:20px; height:20px; cursor:pointer; }
+      [role=dialog] { width:520px; min-height:220px; padding:20px; }
+      input,select,button,[role=switch] { min-width:80px; min-height:28px; }
+    </style></head><body>
+      <h1>章节管理</h1>
+      <table><tbody><tr id="chapter-9">
+        <td>第9章 青石劫</td><td>4675</td><td>待发布</td>
+        <td class="timing">2026-07-26 20:00 <i class="tomato-clock"></i></td>
+      </tr></tbody></table>
+      <script>
+        window.chrome = {runtime: {onMessage: {addListener(fn) { window.__ainovelListener = fn; }}}};
+        window.__confirmed = [];
+        document.querySelector('.tomato-clock').onclick = () => {
+          document.body.insertAdjacentHTML('beforeend', `
+            <div role="dialog" id="modify-timing">
+              <h2>修改定时</h2><p>章节 第9章 青石劫</p>
+              <label>日期 <input id="modify-date" type="date" value="2026-07-26"></label>
+              <label>时间 <select id="modify-time"><option value="20:00">20:00</option></select></label>
+              <button id="cancel-modify">取消</button><button id="confirm-modify">确认修改</button>
+            </div>`);
+          document.getElementById('cancel-modify').onclick = () => document.getElementById('modify-timing').remove();
+          document.getElementById('confirm-modify').onclick = () => {
+            const date = document.getElementById('modify-date').value;
+            const time = document.getElementById('modify-time').value;
+            window.__confirmed.push({date, time});
+            document.querySelector('#chapter-9 .timing').textContent = `${date} ${time}`;
+            document.getElementById('modify-timing').remove();
+          };
+        };
+      </script>
+    </body></html>
+    """
+
+
+def test_scheduled_chapter_can_be_rescheduled_and_read_back_without_deletion():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content(reschedule_flow_html())
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {
+            "type": "reschedulePublication",
+            "options": {
+                "chapterNo": 9, "title": "第九章 青石劫",
+                "publicationDate": "2026-07-25", "publicationTime": "20:00",
+            },
+        })
+        assert result["ok"] is True
+        assert result["code"] == "schedule_rescheduled"
+        assert result["previousPublicationDate"] == "2026-07-26"
+        assert page.evaluate("window.__confirmed") == [{"date": "2026-07-25", "time": "20:00"}]
+        assert "2026-07-25 20:00" in page.locator("#chapter-9").inner_text()
+        browser.close()
+
+
+def test_reschedule_refuses_a_title_mismatch_before_opening_the_dialog():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=CHROME, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.set_content(reschedule_flow_html())
+        page.add_script_tag(path=str(SCRIPT))
+        result = invoke_action(page, {
+            "type": "reschedulePublication",
+            "options": {
+                "chapterNo": 9, "title": "第九章 其他标题",
+                "publicationDate": "2026-07-25", "publicationTime": "20:00",
+            },
+        })
+        assert result["ok"] is False
+        assert result["code"] == "reschedule_title_mismatch"
+        assert page.locator("#modify-timing").count() == 0
+        assert page.evaluate("window.__confirmed") == []
         browser.close()
 
 

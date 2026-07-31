@@ -98,12 +98,12 @@ def build_publication_plan(
     slot: str = DEFAULT_SLOT,
     slots: Iterable[str] = DEFAULT_SLOTS,
 ) -> list[PlanItem]:
-    """Plan one safe chapter per selected publication slot/day.
+    """Pack consecutive chapters into the earliest safe publication dates.
 
     Existing verified schedules reserve quota and are adopted rather than duplicated.
-    The first implementation deliberately uses one chapter per publication date; this
-    avoids scheduling two chapters for the same platform timestamp while leaving room
-    for a future explicit multi-slot policy.
+    Multiple consecutive chapters may share the selected slot/date when their combined
+    quota stays within ``daily_limit``; Fanqie accepts this and the chapter numbers keep
+    their ordering. A chapter is never split and a date is never overbooked.
     """
     if daily_limit <= 0:
         raise PlanningError("daily_limit_must_be_positive")
@@ -171,7 +171,7 @@ def build_publication_plan(
                 ))
             try:
                 existing_date = date.fromisoformat(existing.publication_date)
-                cursor = max(cursor, existing_date + timedelta(days=1))
+                cursor = max(cursor, existing_date)
             except ValueError:
                 pass
             continue
@@ -208,8 +208,9 @@ def build_publication_plan(
             ))
             continue
 
-        # One chapter per publication slot/day. Existing quota is still checked so a
-        # future platform observation can block a date rather than overbook it.
+        # Fill the current day before advancing. This preserves chapter order and uses
+        # the daily allowance instead of wasting a date merely because the selected
+        # publication time is shared by another chapter.
         while usage.get(cursor.isoformat(), 0) + candidate.quota_units > daily_limit:
             cursor += timedelta(days=1)
         publication_date = cursor.isoformat()
@@ -219,6 +220,5 @@ def build_publication_plan(
             candidate.quota_units, publication_date, slot, "planned",
             "resume_current_editor" if resume_existing_editor else None,
         ))
-        cursor += timedelta(days=1)
 
     return result

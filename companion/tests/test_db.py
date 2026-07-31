@@ -28,6 +28,40 @@ def test_bootstrap_states(tmp_path: Path):
     assert db.upsert_manifest_entry("示例小说", entry(5, "5" * 64), "five")["status"] == "ready"
 
 
+def test_platform_title_only_suffixes_later_duplicate_occurrences(tmp_path: Path):
+    db = PublishingDB(tmp_path / "publisher.db")
+    first = entry(24, "2" * 64)
+    first["title"] = "第二十四章 晨钟"
+    second = entry(35, "3" * 64)
+    second["title"] = "第三十五章 晨钟"
+    third = entry(50, "5" * 64)
+    third["title"] = "第五十章 晨钟"
+    db.upsert_manifest_entry("示例小说", first, "first")
+    db.upsert_manifest_entry("示例小说", second, "second")
+    db.upsert_manifest_entry("示例小说", third, "third")
+
+    assert db.get_chapter("示例小说", 24)["platform_title"] == "晨钟"
+    assert db.get_chapter("示例小说", 35)["platform_title"] == "晨钟（二）"
+    assert db.get_chapter("示例小说", 50)["platform_title"] == "晨钟（三）"
+
+
+def test_explicit_platform_rejection_is_not_left_as_submitted_unverified(tmp_path: Path):
+    db = PublishingDB(tmp_path / "publisher.db")
+    row = db.upsert_manifest_entry("示例小说", entry(35, "3" * 64), "body")
+    db.record_event(row["book_id"], 35, "final_submit_armed", "3" * 64, {
+        "plan_id": "missing-plan-is-allowed-for-event",
+        "platform_state": "submitted_unverified",
+    })
+    rejected = db.record_event(row["book_id"], 35, "submission_rejected", "3" * 64, {
+        "error": "platform_submission_rejected",
+        "platform_state": "draft_rejected",
+        "rejection_message": "本书中存在重复标题，请修改后再发布",
+    })
+    assert rejected["status"] == "blocked"
+    assert rejected["platform_state"] == "draft_rejected"
+    assert rejected["last_error"] == "platform_submission_rejected"
+
+
 def test_changed_published_version_becomes_conflict(tmp_path: Path):
     db = PublishingDB(tmp_path / "publisher.db")
     row = db.upsert_manifest_entry("示例小说", entry(5, "5" * 64), "old")
@@ -249,6 +283,32 @@ def test_observed_schedule_requires_separate_chapter_version_verification(tmp_pa
     assert verified["status"] == "scheduled"
     schedule = db.list_verified_schedules(row["book_id"])[0]
     assert schedule["text_sha256"] == "6" * 64
+    assert schedule["version_verified"] is True
+
+
+def test_rescheduled_schedule_replaces_the_previous_verified_date(tmp_path: Path):
+    db = PublishingDB(tmp_path / "publisher.db")
+    row = db.upsert_manifest_entry("示例小说", entry(9, "9" * 64), "正文")
+    db.record_event(row["book_id"], 9, "schedule_verified", "9" * 64, {
+        "platform_state": "scheduled",
+        "publication_date": "2026-07-26",
+        "publication_time": "20:00",
+        "quota_units": 2,
+        "version_verified": True,
+    })
+    changed = db.record_event(row["book_id"], 9, "schedule_rescheduled", "9" * 64, {
+        "platform_state": "scheduled",
+        "publication_date": "2026-07-25",
+        "publication_time": "20:00",
+        "quota_units": 2,
+        "version_verified": True,
+    })
+    assert changed["status"] == "scheduled"
+    assert changed["last_error"] is None
+    schedule = db.list_verified_schedules(row["book_id"])[0]
+    assert schedule["publication_date"] == "2026-07-25"
+    assert schedule["publication_time"] == "20:00"
+    assert schedule["text_sha256"] == "9" * 64
     assert schedule["version_verified"] is True
 
 

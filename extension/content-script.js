@@ -1,6 +1,6 @@
 "use strict";
 
-const PAGE_ADAPTER_VERSION = "0.3.4";
+const PAGE_ADAPTER_VERSION = "0.3.7";
 
 // Selector strategy adapted from NonoOi/fanqie-author-injector (MIT); see THIRD_PARTY_NOTICES.md.
 const FIELD_SELECTORS = {
@@ -49,9 +49,11 @@ const PAGE_ACTIONS = new Set([
   "inspectChapter",
   "inspectPage",
   "openNewChapter",
+  "openExistingChapter",
   "clickNext",
   "completePublicationFlow",
   "submitPreparedPublication",
+  "reschedulePublication",
   "inspectPublicationList",
   "inspectWorks"
 ]);
@@ -75,12 +77,16 @@ async function dispatchPageAction(message) {
       return inspectPage(message.bookName || null, message.workId || null);
     case "openNewChapter":
       return openNewChapter(message.bookName || null, message.workId || null, message.timeoutMs);
+    case "openExistingChapter":
+      return openExistingChapter(Number(message.chapterNo || 0), message.workId || null);
     case "clickNext":
       return await clickNext(message.chapter, message.timeoutMs);
     case "completePublicationFlow":
       return completePublicationFlow(message.options || {});
     case "submitPreparedPublication":
       return submitPreparedPublication(message.options || {});
+    case "reschedulePublication":
+      return reschedulePublication(message.options || {});
     case "inspectPublicationList":
       return inspectPublicationList(message.chapterNos || [], message.timeoutMs);
     case "inspectWorks":
@@ -122,7 +128,7 @@ async function fillChapter(chapter) {
   }
 
   let fields = ready.value;
-  const expectedTitle = pureTitle(chapter.title);
+  const expectedTitle = expectedChapterTitle(chapter);
   const expectedBody = normalizeBody(chapter.body);
   const expectedChapterNo = String(chapter.chapter_no);
   const beforeTitle = readField(fields.titleField).trim();
@@ -208,7 +214,7 @@ function compareChapterFields(fields, chapter) {
   const observedChapterNo = fields.chapterNumberField
     ? readField(fields.chapterNumberField).trim()
     : String(chapter.chapter_no);
-  const expectedTitle = pureTitle(chapter.title);
+  const expectedTitle = expectedChapterTitle(chapter);
   const expectedBody = normalizeBody(chapter.body);
   const expectedChapterNo = String(chapter.chapter_no);
   return {
@@ -269,7 +275,7 @@ async function waitForHydratedEditor(timeoutMs = EDITOR_HYDRATION_TIMEOUT_MS) {
 }
 
 function fillExpectedChapterFields(fields, chapter) {
-  const expectedTitle = pureTitle(chapter.title);
+  const expectedTitle = expectedChapterTitle(chapter);
   const expectedBody = normalizeBody(chapter.body);
   const expectedChapterNo = String(chapter.chapter_no);
   const currentTitle = readField(fields.titleField).trim();
@@ -285,7 +291,7 @@ function chapterFieldsAreSafelyRefillable(fields, chapter) {
   const title = readField(fields.titleField).trim();
   const body = normalizeBody(readField(fields.editor));
   const chapterNo = fields.chapterNumberField ? readField(fields.chapterNumberField).trim() : "";
-  const titleSafe = !title || normalizeCompact(title) === normalizeCompact(pureTitle(chapter.title));
+  const titleSafe = !title || normalizeCompact(title) === normalizeCompact(expectedChapterTitle(chapter));
   const bodySafe = isEmptyEditorText(body) || body === normalizeBody(chapter.body);
   const chapterSafe = !chapterNo || normalizeChapterNumber(chapterNo) === String(chapter.chapter_no);
   return titleSafe && bodySafe && chapterSafe && isEmptyEditorText(body);
@@ -452,6 +458,10 @@ function pureTitle(title) {
     .trim();
 }
 
+function expectedChapterTitle(chapter) {
+  return pureTitle(chapter?.platform_title || chapter?.title || "");
+}
+
 function normalizeCompact(value) {
   return String(value || "").replace(/[\s\u200b\ufeff]+/gu, "").trim();
 }
@@ -563,6 +573,9 @@ const EDITOR_SETTLE_TIMEOUT_MS = 8_000;
 const EDITOR_CONTENT_STABLE_MS = 2_500;
 const NEXT_READY_TIMEOUT_MS = 15_000;
 const NEXT_READY_STABLE_MS = 500;
+const DIALOG_ACTION_TIMEOUT_MS = 10_000;
+const POST_TYPO_TIMEOUT_MS = 15_000;
+const SETTINGS_CONTROL_TIMEOUT_MS = 8_000;
 const NEW_CHAPTER_READY_TIMEOUT_MS = 15_000;
 const PUBLICATION_LIST_TIMEOUT_MS = 15_000;
 const PUBLICATION_LIST_STABLE_MS = 1_200;
@@ -664,6 +677,58 @@ async function openNewChapter(expectedBookName = null, expectedWorkId = null, ti
   };
 }
 
+async function openExistingChapter(chapterNo, expectedWorkId = null) {
+  const pageText = visiblePageText();
+  if (isLoginPage(pageText)) {
+    return failure("番茄登录状态已失效，请先登录。", "login_required", { mutationAttempted: false });
+  }
+  const currentWorkId = extractPlatformWorkId(location.href);
+  if (expectedWorkId && currentWorkId !== String(expectedWorkId)) {
+    return failure("当前番茄页面不是已绑定的目标作品，拒绝打开章节。", "work_identity_mismatch", {
+      currentWorkId, expectedWorkId, mutationAttempted: false
+    });
+  }
+  if (!Number.isInteger(chapterNo) || chapterNo < 1) {
+    return failure("打开已有章节缺少有效章节号。", "chapter_no_missing", { mutationAttempted: false });
+  }
+
+  // 在章节管理列表中找到唯一的目标章节行，点进去打开它的编辑器（与“新建章节”相反，不新建）。
+  const rowReady = await waitFor(() => {
+    const row = findManagedChapterRow(chapterNo);
+    return row ? { value: row } : false;
+  }, Date.now() + NEW_CHAPTER_READY_TIMEOUT_MS);
+  if (!rowReady.value) {
+    return failure(
+      `章节管理页没有稳定显示唯一的目标第 ${chapterNo} 章行，无法打开编辑器。`,
+      "existing_chapter_row_missing",
+      { mutationAttempted: false, url: location.href }
+    );
+  }
+
+  const row = rowReady.value;
+  // 优先点击行内可点的章节标题/编辑入口，必要时回退到整行点击。
+  const entry = row.querySelector("a, [role='button'], button, .chapter-title, .title") || row;
+  try {
+    clickVisible(entry);
+  } catch (error) {
+    return failure(normalizeError(error), "existing_chapter_click_rejected", {
+      mutationAttempted: false,
+      selected: describeActionElement(entry)
+    });
+  }
+
+  // 等待编辑器字段挂载，确认确实进入了第 chapterNo 章的编辑页。
+  const editor = await waitForEditorFields();
+  if (!editor.value) {
+    return failure(
+      `已点击第 ${chapterNo} 章，但编辑器在超时内未加载，可能跳转到了错误页面。`,
+      "existing_chapter_editor_timeout",
+      { mutationAttempted: true, url: location.href }
+    );
+  }
+  return { ok: true, code: "existing_chapter_opened", mutationAttempted: true, page: inspectPage(), chapterNo };
+}
+
 async function clickNext(chapter, timeoutMs = null) {
   // The real Fanqie action is currently a small custom ByteDance control in the top
   // editor bar, not always a semantic <button>. Wait for that asynchronous control while
@@ -762,8 +827,7 @@ async function completePublicationFlow(options) {
   const transitionTimeoutMs = Number.isFinite(requestedTimeout)
     ? Math.min(Math.max(requestedTimeout, 100), AUTOMATION_LIMITS.transitionMs)
     : AUTOMATION_LIMITS.transitionMs;
-  const deadline = Date.now() + transitionTimeoutMs;
-  const transition = await waitFor(() => detectPostNextState(), deadline);
+  const transition = await waitFor(() => detectPostNextState(), Date.now() + transitionTimeoutMs);
   if (transition.blocked) {
     return failure("检测到风险控制或验证码页面，必须人工处理。", "risk_control_detected", {
       transition: options.nextTransition || null,
@@ -783,108 +847,155 @@ async function completePublicationFlow(options) {
       diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null)
     });
   }
+
+  // Stage 1: Fanqie may first show a typo warning. Arco renders the message body and
+  // footer as siblings, so the smallest node containing “错别字” is not the dialog.
+  // Re-resolve the complete dialog surface until its exact Submit action is mounted.
   if (transition.value.kind === "typo") {
-    const submit = findButtonInRoot(transition.value.root, ["提交"]);
-    if (!submit.element) return failure("已识别错别字提示，但没有找到同一弹窗内的提交按钮。", "typo_submit_missing");
-    clickVisible(submit.element);
-    const disappeared = await waitFor(() => !findTypoDialog(), Date.now() + 8_000);
-    if (!disappeared.value) return failure("错别字提示提交后没有消失，已停止。", "typo_dialog_not_closed");
-    // The full-check control is mounted asynchronously in some Fanqie releases.
-    // Do not fail in the small gap between the typo dialog disappearing and the next
-    // stage appearing.
-    const nextStage = await waitFor(() => {
-      if (findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu)) return { blocked: true };
-      return findPublicationRoot() || hasPublicationSettings(visiblePageText()) || findActionButton(["全面检测", "全文检测"]).element;
-    }, Date.now() + 10_000);
+    const typoSubmit = await waitFor(() => {
+      if (findRiskControlDialog()) return { blocked: true };
+      const dialog = findTypoDialog();
+      if (!dialog) return false;
+      const action = findDialogAction(dialog, ["提交"]);
+      return action.element ? { value: { dialog, action } } : false;
+    }, Date.now() + DIALOG_ACTION_TIMEOUT_MS);
+    if (typoSubmit.blocked) return failure("错别字提示期间出现风险控制，已停止。", "risk_control_detected");
+    if (!typoSubmit.value) {
+      return failure("已识别错别字提示，但提交按钮在 10 秒内仍未完整加载。", "typo_submit_missing", {
+        diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null),
+        typoDialog: describeDialogSurface(findTypoDialog())
+      });
+    }
+    clickVisible(typoSubmit.value.action.element);
+    const nextStage = await waitFor(() => detectAfterTypoState(), Date.now() + POST_TYPO_TIMEOUT_MS);
     if (nextStage.blocked) return failure("错别字提示后出现风险控制，已停止。", "risk_control_detected");
     if (!nextStage.value) {
-      return failure("错别字提示已提交，但后续检测页面没有加载出来。", "post_typo_state_unknown", {
+      return failure("错别字提示已提交，但内容检测窗口没有加载出来。", "post_typo_state_unknown", {
         diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null)
       });
     }
   }
 
-  const risk = findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu);
-  if (risk) return failure("检测到风险控制或验证码页面，必须人工处理。", "risk_control_detected");
-
-  const settingsAlreadyVisible = hasPublicationSettings(visiblePageText());
-  const fullCheck = findActionButton(["全面检测", "全文检测"]);
-  if (!settingsAlreadyVisible && !fullCheck.element) {
-    return failure("没有找到“全面检测”按钮或发布设置，页面状态未知。", "full_check_button_missing");
-  } else if (!settingsAlreadyVisible) {
-    const before = visiblePageText();
-    clickVisible(fullCheck.element);
+  // Stage 2: choose the explicit full-content inspection path. Do not confuse the
+  // lower/basic action or a page-wide text match with the dialog's real action.
+  const settingsBeforeCheck = findPublicationRoot();
+  if (!settingsBeforeCheck) {
+    const detection = await waitFor(() => {
+      if (findRiskControlDialog()) return { blocked: true };
+      const dialog = findDetectionDialog();
+      if (!dialog) return false;
+      const action = findDialogAction(dialog, ["全面检测", "全文检测"]);
+      return action.element ? { value: { dialog, action } } : false;
+    }, Date.now() + DIALOG_ACTION_TIMEOUT_MS);
+    if (detection.blocked) return failure("内容检测阶段出现风险控制，已停止。", "risk_control_detected");
+    if (!detection.value) {
+      return failure("没有找到内容检测窗口中的“全面检测”按钮。", "full_check_button_missing", {
+        diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null),
+        detectionDialog: describeDialogSurface(findDetectionDialog())
+      });
+    }
+    clickVisible(detection.value.action.element);
     const checked = await waitFor(() => {
-      if (findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu)) return { blocked: true };
-      const text = visiblePageText();
-      const settings = hasPublicationSettings(text);
-      const button = findActionButton(["全面检测", "全文检测"]);
-      const completeText = /检测完成|检测通过|检测结果|发布设置/iu.test(text);
-      return settings || (completeText && text !== before && (!button.element || !button.element.disabled));
+      if (findRiskControlDialog()) return { blocked: true };
+      const settings = findPublicationRoot();
+      return settings ? { value: settings } : false;
     }, Date.now() + AUTOMATION_LIMITS.fullCheckMs);
     if (checked.blocked) return failure("全面检测触发了风险控制，已停止。", "risk_control_detected");
-    if (!checked.value) return failure("等待“全面检测”完成超时，未进入可验证的发布设置。", "full_check_timeout");
+    if (!checked.value) {
+      return failure("全面检测后 60 秒内没有进入发布设置。", "full_check_timeout", {
+        diagnostics: captureTransitionDiagnostics(options.nextTransition?.before || null),
+        detectionDialog: describeDialogSurface(findDetectionDialog())
+      });
+    }
   }
 
-  const settings = findPublicationRoot();
-  if (!settings) return failure("没有识别到发布设置区域，已停止。", "publish_settings_missing");
-
-  const contextResult = verifyPublicationContext(settings, options);
-  if (!contextResult.ok) return contextResult;
-
-  const aiResult = configureAiPolicy(settings, options.aiPolicy || "remember");
-  if (!aiResult.ok) return aiResult;
-  const scheduleResult = configureSchedule(settings, options.publicationDate, options.publicationTime);
-  if (!scheduleResult.ok) return scheduleResult;
-
-  const submit = findButtonInRoot(settings, ["定时发布", "确认发布", "提交发布", "发布"]);
-  if (!submit.element) return failure("发布设置中没有找到可验证的最终提交按钮。", "final_submit_missing");
-  if (options.deferFinalSubmit) {
-    return {
-      ok: true,
-      code: "publication_ready",
-      publicationDate: scheduleResult.publicationDate,
-      publicationTime: scheduleResult.publicationTime,
-      aiPolicy: aiResult.policy,
-      evidence: normalizeBody(readField(settings)).slice(0, 1000),
-      url: location.href
-    };
-  }
+  // Stage 3: verify the target chapter, AI declaration, scheduling switch, and exact
+  // date/time. Each controlled setting is read back before the final action is exposed.
+  const prepared = await preparePublicationSettings(options);
+  if (!prepared.ok) return prepared;
+  if (options.deferFinalSubmit) return prepared;
   return submitPreparedPublication(options);
 }
 
-async function submitPreparedPublication(options) {
-  const settings = findPublicationRoot();
-  if (!settings) return failure("没有识别到已经准备好的发布设置区域。", "publish_settings_missing");
+async function preparePublicationSettings(options) {
+  const settingsWait = await waitFor(() => {
+    const root = findPublicationRoot();
+    return root ? { value: root } : false;
+  }, Date.now() + DIALOG_ACTION_TIMEOUT_MS);
+  const settings = settingsWait.value;
+  if (!settings) return failure("没有识别到完整的发布设置窗口，已停止。", "publish_settings_missing", {
+    diagnostics: captureTransitionDiagnostics()
+  });
+
   const contextResult = verifyPublicationContext(settings, options);
   if (!contextResult.ok) return contextResult;
-  const aiResult = configureAiPolicy(settings, options.aiPolicy || "remember");
+  const aiResult = await configureAiPolicy(settings, options.aiPolicy || "remember");
   if (!aiResult.ok) return aiResult;
-  const scheduleResult = configureSchedule(settings, options.publicationDate, options.publicationTime);
+  const scheduleResult = await configureSchedule(settings, options.publicationDate, options.publicationTime);
   if (!scheduleResult.ok) return scheduleResult;
-  const submit = findButtonInRoot(settings, ["定时发布", "确认发布", "提交发布", "发布"]);
-  if (!submit.element) return failure("发布设置中没有找到可验证的最终提交按钮。", "final_submit_missing");
+  const submit = findDialogAction(settings, ["确认发布", "定时发布", "提交发布", "发布"]);
+  if (!submit.element) return failure("发布设置中没有找到可验证的“确认发布”按钮。", "final_submit_missing", {
+    settings: describeDialogSurface(settings), diagnostics: captureTransitionDiagnostics()
+  });
+  return {
+    ok: true,
+    code: "publication_ready",
+    publicationDate: scheduleResult.publicationDate,
+    publicationTime: scheduleResult.publicationTime,
+    aiPolicy: aiResult.policy,
+    evidence: normalizeBody(readField(settings)).slice(0, 1000),
+    selectedFinalAction: submit.descriptor || describeActionElement(submit.element),
+    url: location.href
+  };
+}
+
+async function submitPreparedPublication(options) {
+  const prepared = await preparePublicationSettings(options);
+  if (!prepared.ok) return prepared;
+  const settings = findPublicationRoot();
+  if (!settings) return failure("最终提交前发布设置窗口已消失。", "publish_settings_missing");
+  const submit = findDialogAction(settings, ["确认发布", "定时发布", "提交发布", "发布"]);
+  if (!submit.element) return failure("发布设置中没有找到可验证的“确认发布”按钮。", "final_submit_missing");
+
   const beforeSubmitText = visiblePageText();
+  const beforeSubmitUrl = location.href;
+  const rejectionNodesBefore = new Set(visibleSubmissionRejections().map((item) => item.element));
+  const selected = submit.descriptor || describeActionElement(submit.element);
   clickVisible(submit.element);
 
   const success = await waitFor(() => {
-    const riskDialog = findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu);
+    const riskDialog = findRiskControlDialog();
     if (riskDialog) return { blocked: true };
+    const rejection = visibleSubmissionRejections().find((item) => !rejectionNodesBefore.has(item.element));
+    if (rejection) return { value: { rejected: true, rejection } };
     const text = visiblePageText();
-    const successText = /定时发布成功|发布成功|提交成功|已定时发布|已发布|发布完成/iu.test(text);
-    const changed = text !== beforeSubmitText;
-    const scheduleEvidence = text.includes(String(options.publicationDate || "")) || text.includes(String(options.publicationTime || "")) || text.includes(String(options.chapterNo || ""));
-    return successText && changed && (scheduleEvidence || !hasPublicationSettings(text));
+    const acceptedToast = /已提交[^\n]{0,40}(?:小时|审核)|预计\s*\d+\s*小时内完成审核|提交成功|定时发布成功|发布成功|已定时发布|发布完成/iu.test(text);
+    const management = isChapterManagementPage(text);
+    const changed = text !== beforeSubmitText || location.href !== beforeSubmitUrl;
+    return changed && (acceptedToast || management)
+      ? { value: { acceptedToast, management, text: text.slice(0, 1200), url: location.href } }
+      : false;
   }, Date.now() + AUTOMATION_LIMITS.successMs);
   if (success.blocked) return failure(
     "最终提交后出现风险控制或验证码，结果未知。",
     "risk_control_detected",
-    { finalSubmitAttempted: true }
+    { finalSubmitAttempted: true, selected }
+  );
+  if (success.value?.rejected) return failure(
+    `番茄拒绝发布：${success.value.rejection.message}`,
+    "platform_submission_rejected",
+    {
+      finalSubmitAttempted: true,
+      submissionRejected: true,
+      rejectionMessage: success.value.rejection.message,
+      selected,
+      url: location.href
+    }
   );
   if (!success.value) return failure(
-    "最终提交后未读取到可验证的成功/定时状态，结果未知。",
+    "已点击“确认发布”，但 25 秒内没有看到“已提交”或章节管理页；结果未知。",
     "submission_unverified",
-    { finalSubmitAttempted: true }
+    { finalSubmitAttempted: true, selected, url: location.href }
   );
 
   return {
@@ -892,10 +1003,11 @@ async function submitPreparedPublication(options) {
     code: "schedule_submitted",
     publicationDate: options.publicationDate || null,
     publicationTime: options.publicationTime || null,
-    aiPolicy: aiResult.policy,
+    aiPolicy: prepared.aiPolicy,
     finalSubmitAttempted: true,
-    evidence: visiblePageText().slice(0, 1000),
-    url: location.href
+    selected,
+    evidence: success.value.text,
+    url: success.value.url
   };
 }
 
@@ -912,6 +1024,14 @@ function verifyPublicationContext(root, options) {
       contextPreview: text.slice(0, 500)
     });
   }
+  const expectedTitle = pureTitle(options.title || "");
+  if (expectedTitle && !normalizeCompact(text).includes(normalizeCompact(`第${chapterNo}章${expectedTitle}`))) {
+    return failure("发布设置中的章节标题与计划不一致，拒绝提交。", "publish_title_context_unverified", {
+      expectedChapterNo: chapterNo,
+      expectedTitle,
+      contextPreview: text.slice(0, 500)
+    });
+  }
   const previous = text.match(/上(?:一|次)(?:次)?(?:提交|发布)[\s\S]{0,50}?第?\s*(\d+)\s*章/iu);
   if (previous && Number(previous[1]) !== chapterNo - 1) {
     return failure("发布设置显示的上次章节与当前计划不连续，已停止。", "previous_chapter_mismatch", {
@@ -923,19 +1043,50 @@ function verifyPublicationContext(root, options) {
 }
 
 function detectPostNextState() {
-  const riskDialog = findKnownDialog(/风险|违规|验证码|安全验证|人机验证|captcha/iu);
+  const riskDialog = findRiskControlDialog();
   if (riskDialog) return { blocked: true };
   const typoDialog = findTypoDialog();
   if (typoDialog) return { value: { kind: "typo", root: typoDialog } };
   if (findPublicationRoot() || hasPublicationSettings(visiblePageText())) {
     return { value: { kind: "ready" } };
   }
-  if (findActionButton(["全面检测", "全文检测"]).element) {
+  if (findDetectionDialog()) {
     return { value: { kind: "ready" } };
   }
   const messages = visibleValidationMessages();
   if (messages.length) return { value: { kind: "validation", messages } };
   return false;
+}
+
+function detectAfterTypoState() {
+  if (findRiskControlDialog()) return { blocked: true };
+  const settings = findPublicationRoot();
+  if (settings) return { value: { kind: "settings", root: settings } };
+  const detection = findDetectionDialog();
+  if (detection) return { value: { kind: "detection", root: detection } };
+  return false;
+}
+
+function visibleSubmissionRejections() {
+  // Fanqie's business API reports many validation failures as HTTP 200 and renders the
+  // message in a transient Arco toast. Treat an explicit rejection as proof that no
+  // submission was accepted instead of waiting and mislabelling the result unknown.
+  const pattern = /本书中存在重复标题|请修改后再发布|(?:发布|提交)(?:失败|未成功|被拒绝)|无法(?:发布|提交)|(?:今日|每日|当日)[^\n]{0,40}(?:字数|上限|限制)|(?:字数|章节)[^\n]{0,30}(?:超过|超出)[^\n]{0,20}(?:限制|上限)/iu;
+  const candidates = [...document.querySelectorAll(
+    "[role='alert'], [aria-live], .arco-message, [class*='message'], [class*='notification'], [class*='toast'], [class*='error']"
+  )]
+    .filter(isVisible)
+    .map((element) => ({ element, message: normalizeBody(readField(element)).trim() }))
+    .filter((item) => item.message && pattern.test(item.message));
+  return candidates.filter((item) => !candidates.some((other) => (
+    other !== item && item.element.contains(other.element) && other.message === item.message
+  )));
+}
+
+function isChapterManagementPage(text = visiblePageText()) {
+  const workId = extractPlatformWorkId(location.href);
+  const routeMatches = /\/main\/writer\/chapter-manage\/\d{10,}/u.test(location.pathname);
+  return Boolean(workId && routeMatches && /章节管理/iu.test(String(text || "")));
 }
 
 function visibleValidationMessages() {
@@ -1165,6 +1316,179 @@ function readPublicationListSnapshot(chapterNos) {
   };
 }
 
+function findManagedChapterRow(chapterNo) {
+  const expected = Number(chapterNo);
+  const candidates = [...document.querySelectorAll("tr, [role='row']")]
+    .filter(isVisible)
+    .filter((element) => {
+      const numbers = distinctChapterNumbers(readField(element));
+      return numbers.size === 1 && numbers.has(expected);
+    });
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function managedChapterRowDetails(row, chapterNo) {
+  if (!row) return null;
+  const text = normalizeBody(readField(row));
+  const heading = text.match(new RegExp(`第\\s*${Number(chapterNo)}\\s*章\\s*([^\\n\\t]*)`, "iu"));
+  const timeMatch = text.match(/(?:^|\D)([012]?\d):([0-5]\d)(?:\D|$)/u);
+  return {
+    text,
+    title: String(heading?.[1] || "").trim(),
+    publicationDate: parsePublicationDate(text),
+    publicationTime: timeMatch ? `${String(timeMatch[1]).padStart(2, "0")}:${timeMatch[2]}` : null,
+    scheduled: /待发布|定时|已安排|审核中|待审核|审核通过/iu.test(text) && !/已发布|已上线/iu.test(text)
+  };
+}
+
+function findScheduleModificationRoot(chapterNo) {
+  const root = findDialogSurface(/修改定时/iu);
+  if (!root) return null;
+  const text = normalizeBody(readField(root));
+  const chapterPattern = new RegExp(`第\\s*${Number(chapterNo)}\\s*章(?:\\s|$)`, "iu");
+  if (!chapterPattern.test(text)) return null;
+  const dateField = findFormControlByLabel(root, /^(?:发布)?日期$/u, "date");
+  const timeField = findFormControlByLabel(root, /^(?:发布)?时间$/u, "time");
+  const confirm = findDialogAction(root, ["确认修改"]);
+  return dateField && timeField && confirm.element ? { root, dateField, timeField, confirm } : null;
+}
+
+async function reschedulePublication(options) {
+  const chapterNo = Number(options.chapterNo || 0);
+  const publicationDate = String(options.publicationDate || "");
+  const publicationTime = String(options.publicationTime || "");
+  if (!Number.isInteger(chapterNo) || chapterNo < 1) {
+    return failure("修改定时缺少有效章节号。", "reschedule_chapter_missing");
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(publicationDate)) {
+    return failure("修改定时的日期格式无效。", "schedule_date_invalid");
+  }
+  if (!/^\d{2}:\d{2}$/u.test(publicationTime)) {
+    return failure("修改定时的时间格式无效。", "schedule_time_invalid");
+  }
+
+  const rowReady = await waitFor(() => {
+    const candidate = findManagedChapterRow(chapterNo);
+    const details = managedChapterRowDetails(candidate, chapterNo);
+    return candidate && details?.publicationDate && details?.publicationTime
+      ? { value: { row: candidate, details } }
+      : false;
+  }, Date.now() + DIALOG_ACTION_TIMEOUT_MS);
+  if (!rowReady.value) return failure(
+    "章节列表在 10 秒内没有稳定显示唯一的目标章节行，未修改定时。",
+    "reschedule_row_unverified"
+  );
+  const { row, details: before } = rowReady.value;
+  const expectedTitle = pureTitle(options.title || "");
+  if (expectedTitle && normalizeCompact(before.title) !== normalizeCompact(expectedTitle)) {
+    return failure("章节标题与本地账本不一致，拒绝修改定时。", "reschedule_title_mismatch", {
+      expectedTitle, observedTitle: before.title
+    });
+  }
+  if (!before.scheduled || !before.publicationDate || !before.publicationTime) {
+    return failure("目标章节不是可验证的定时待发布状态。", "reschedule_state_unverified", { before });
+  }
+  if (before.publicationDate === publicationDate && before.publicationTime === publicationTime) {
+    return { ok: true, code: "schedule_unchanged", chapterNo, publicationDate, publicationTime, evidence: before.text };
+  }
+
+  const clockCandidates = [...row.querySelectorAll(".tomato-clock, [class*='clock']")]
+    .filter(isVisible)
+    .filter(isActionEnabled);
+  if (clockCandidates.length !== 1) {
+    return failure("没有找到唯一可验证的“修改定时”控件。", "reschedule_action_unverified", {
+      candidateCount: clockCandidates.length, before
+    });
+  }
+  clickVisible(clockCandidates[0]);
+
+  let lastDialog = null;
+  const hydrated = await waitFor(() => {
+    if (findRiskControlDialog()) return { blocked: true };
+    const anyDialog = findDialogSurface(/修改定时/iu);
+    if (anyDialog) lastDialog = anyDialog;
+    const ready = findScheduleModificationRoot(chapterNo);
+    return ready ? { value: ready } : false;
+  }, Date.now() + DIALOG_ACTION_TIMEOUT_MS);
+  if (hydrated.blocked) return failure("修改定时时出现风险控制或验证码，已停止。", "risk_control_detected");
+  if (!hydrated.value) return failure("“修改定时”窗口没有完整加载，未提交修改。", "reschedule_dialog_unverified", {
+    dialog: describeDialogSurface(lastDialog)
+  });
+
+  let current = hydrated.value;
+  let dateField = current.dateField;
+  if (!dateMatches(readControlValue(dateField), publicationDate)) {
+    const selectedDate = isArcoPickerInput(dateField)
+      ? await selectArcoDate(dateField, publicationDate)
+      : setPlainScheduleControl(dateField, publicationDate);
+    if (!selectedDate.ok) return selectedDate;
+  }
+  const dateVerified = await waitForStableFormValue(
+    current.root, /^(?:发布)?日期$/u, "date", publicationDate, dateMatches
+  );
+  if (!dateVerified.value) return failure("修改定时的日期没有被平台控件确认。", "reschedule_date_unverified", {
+    expected: publicationDate, observed: dateVerified.observedValue || ""
+  });
+
+  current = findScheduleModificationRoot(chapterNo) || current;
+  let timeField = current.timeField;
+  if (!timeMatches(readControlValue(timeField), publicationTime)) {
+    const selectedTime = isArcoPickerInput(timeField)
+      ? await selectArcoTime(timeField, publicationTime)
+      : setPlainScheduleControl(timeField, publicationTime);
+    if (!selectedTime.ok) return selectedTime;
+  }
+  const timeVerified = await waitForStableFormValue(
+    current.root, /^(?:发布)?时间$/u, "time", publicationTime, timeMatches
+  );
+  if (!timeVerified.value) return failure("修改定时的时间没有被平台控件确认。", "reschedule_time_unverified", {
+    expected: publicationTime, observed: timeVerified.observedValue || ""
+  });
+  if (visibleArcoPickerContainers().length) {
+    return failure("日期或时间选择面板仍未关闭，拒绝确认修改。", "schedule_picker_still_open");
+  }
+
+  current = findScheduleModificationRoot(chapterNo);
+  if (!current) return failure("确认修改前窗口状态发生变化，已停止。", "reschedule_dialog_changed");
+  const dialogText = normalizeBody(readField(current.root));
+  if (!new RegExp(`第\\s*${chapterNo}\\s*章(?:\\s|$)`, "iu").test(dialogText)) {
+    return failure("确认修改前章节号发生变化，已停止。", "reschedule_chapter_changed");
+  }
+  const selected = current.confirm.descriptor || describeActionElement(current.confirm.element);
+  clickVisible(current.confirm.element);
+
+  const verified = await waitFor(() => {
+    if (findRiskControlDialog()) return { blocked: true };
+    const refreshedRow = findManagedChapterRow(chapterNo);
+    const observed = managedChapterRowDetails(refreshedRow, chapterNo);
+    const dialogClosed = !findDialogSurface(/修改定时/iu);
+    return dialogClosed && observed?.publicationDate === publicationDate && observed?.publicationTime === publicationTime
+      ? { value: observed }
+      : false;
+  }, Date.now() + AUTOMATION_LIMITS.successMs);
+  if (verified.blocked) return failure(
+    "确认修改后出现风险控制或验证码，结果未知。", "risk_control_detected",
+    { scheduleModificationAttempted: true, selected }
+  );
+  if (!verified.value) return failure(
+    "已点击“确认修改”，但没有从章节列表回读到目标时间；结果未知。", "reschedule_unverified",
+    { scheduleModificationAttempted: true, selected, chapterNo, publicationDate, publicationTime }
+  );
+  return {
+    ok: true,
+    code: "schedule_rescheduled",
+    chapterNo,
+    previousPublicationDate: before.publicationDate,
+    previousPublicationTime: before.publicationTime,
+    publicationDate,
+    publicationTime,
+    scheduleModificationAttempted: true,
+    selected,
+    evidence: verified.value.text,
+    url: location.href
+  };
+}
+
 function publicationSnapshotSignature(snapshot) {
   return JSON.stringify({
     workId: snapshot.workId || null,
@@ -1273,12 +1597,31 @@ function localIsoDate(value) {
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
 }
 
-function configureAiPolicy(root, policy) {
+async function configureAiPolicy(root, policy) {
   const normalized = String(policy || "remember");
+  const aiGroup = findSettingGroup(root, /是否\s*使用\s*AI|使用\s*AI/iu, /(?:^|\s)是(?:\s|$)|(?:^|\s)否(?:\s|$)/u);
+  if (!aiGroup) return failure("发布设置中没有找到完整的“是否使用 AI”选项。", "ai_choice_missing");
+
   if (normalized === "remember") {
-    const selected = findSelectedChoice(root, /使用\s*AI|不使用\s*AI|是|否|AI/iu);
-    if (!selected) return failure("发布设置中的 AI 选项没有明确选择，无法安全沿用。", "ai_choice_ambiguous");
-    return { ok: true, policy: selected.text };
+    const selected = findSelectedAiChoice(aiGroup);
+    if (selected) return { ok: true, policy: selected.text };
+    // 页面没有选中任何 AI 选项：不要中断发布，默认声明“使用 AI”并主动勾选，
+    // 与 background 的 resolveAiPolicy 兜底保持一致，解决“AI 选项没有明确选择，无法安全沿用”。
+    const choice = findAiChoice(aiGroup, "yes");
+    if (!choice?.element) return failure("没有找到指定的 AI 声明选项。", "ai_choice_missing", {
+      aiGroup: normalizeBody(readField(aiGroup)).slice(0, 500)
+    });
+    if (!elementIsSelected(choice.element)) clickVisible(choice.clickTarget || choice.element);
+    const verified = await waitFor(() => {
+      const current = findSelectedAiChoice(aiGroup);
+      if (!current) return false;
+      return current.kind === "yes" ? { value: current } : false;
+    }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+    if (!verified.value) return failure("AI 声明选项点击后无法验证。", "ai_choice_unverified", {
+      expected: "是",
+      aiGroup: normalizeBody(readField(aiGroup)).slice(0, 500)
+    });
+    return { ok: true, policy: verified.value.text };
   }
   if (normalized === "ask") {
     return {
@@ -1288,46 +1631,274 @@ function configureAiPolicy(root, policy) {
       code: "ai_choice_required"
     };
   }
+
   const wantUse = normalized === "use" || normalized === "yes" || normalized === "使用AI";
   const wantNo = normalized === "no" || normalized === "否" || normalized === "不使用AI";
   if (!wantUse && !wantNo) return failure("未知的 AI 声明策略。", "ai_policy_unknown");
-  const choice = findChoice(root, wantUse ? /使用\s*AI|是/iu : /不使用\s*AI|否/iu);
-  if (!choice.element) return failure("没有找到指定的 AI 声明选项。", "ai_choice_missing");
-  clickVisible(choice.element);
-  const selected = findSelectedChoice(root, /使用\s*AI|不使用\s*AI|是|否|AI/iu);
-  if (!selected || (wantUse && !/是|使用/iu.test(selected.text)) || (wantNo && !/否|不使用/iu.test(selected.text))) {
-    return failure("AI 声明选项点击后无法验证。", "ai_choice_unverified");
-  }
-  return { ok: true, policy: selected.text };
+  const choice = findAiChoice(aiGroup, wantUse ? "yes" : "no");
+  if (!choice.element) return failure("没有找到指定的 AI 声明选项。", "ai_choice_missing", {
+    aiGroup: normalizeBody(readField(aiGroup)).slice(0, 500)
+  });
+  if (!elementIsSelected(choice.element)) clickVisible(choice.clickTarget || choice.element);
+  const verified = await waitFor(() => {
+    const current = findSelectedAiChoice(aiGroup);
+    if (!current) return false;
+    const matches = wantUse ? current.kind === "yes" : current.kind === "no";
+    return matches ? { value: current } : false;
+  }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (!verified.value) return failure("AI 声明选项点击后无法验证。", "ai_choice_unverified", {
+    expected: wantUse ? "是" : "否",
+    aiGroup: normalizeBody(readField(aiGroup)).slice(0, 500)
+  });
+  return { ok: true, policy: verified.value.text };
 }
 
-function configureSchedule(root, publicationDate, publicationTime) {
+async function configureSchedule(root, publicationDate, publicationTime) {
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(String(publicationDate || ""))) return failure("计划日期格式无效。", "schedule_date_invalid");
   if (!/^\d{2}:\d{2}$/u.test(String(publicationTime || ""))) return failure("计划时间格式无效。", "schedule_time_invalid");
 
-  const timing = findChoice(root, /定时发布|定时/iu);
-  if (!timing.element) return failure("没有找到明确的“定时发布”模式选项。", "schedule_mode_missing");
-  clickVisible(timing.element);
-  const selectedTiming = findSelectedChoice(root, /定时发布|定时/iu);
-  if (!selectedTiming) return failure("“定时发布”模式点击后无法验证，拒绝最终提交。", "schedule_mode_unverified");
+  const timing = findLabeledToggle(root, /定时发布/iu);
+  if (!timing.element) return failure("没有找到“定时发布”开关。", "schedule_mode_missing", {
+    settings: describeDialogSurface(root)
+  });
+  if (!toggleIsSelected(timing.element)) clickVisible(timing.clickTarget || timing.element);
+  const enabled = await waitFor(() => {
+    const current = findLabeledToggle(root, /定时发布/iu);
+    return current.element && toggleIsSelected(current.element) ? { value: current } : false;
+  }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (!enabled.value) return failure("“定时发布”开关点击后无法验证。", "schedule_mode_unverified");
 
-  const dateField = findLabeledControl(root, /日期|发布日|时间/iu, "date");
-  if (!dateField) return failure("没有找到可验证的定时日期控件。", "schedule_date_control_missing");
-  setControlValue(dateField, publicationDate);
-  const observedDate = readControlValue(dateField);
-  if (!dateMatches(observedDate, publicationDate)) return failure("定时日期写入后校验不一致。", "schedule_date_unverified", { observedDate });
+  // Date/time controls are mounted only after the switch animation. Resolve them by
+  // their own form row instead of assuming the label is the input's direct parent.
+  const controls = await waitFor(() => {
+    const dateField = findFormControlByLabel(root, /^(?:发布)?日期$/u, "date");
+    const timeField = findFormControlByLabel(root, /^(?:发布)?时间$/u, "time");
+    return dateField && timeField ? { value: { dateField, timeField } } : false;
+  }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (!controls.value?.dateField) return failure("定时开关已打开，但没有找到日期控件。", "schedule_date_control_missing", {
+    settings: describeDialogSurface(root)
+  });
+  if (!controls.value?.timeField) return failure("定时开关已打开，但没有找到时间控件。", "schedule_time_control_missing", {
+    settings: describeDialogSurface(root)
+  });
 
-  const timeField = findLabeledControl(root, /时间|时刻/iu, "time");
-  if (timeField) {
-    setControlValue(timeField, publicationTime);
-  } else {
-    const timeChoice = findChoice(root, new RegExp(escapeRegex(publicationTime), "u"));
-    if (!timeChoice.element) return failure("没有找到可验证的定时时间控件。", "schedule_time_control_missing");
-    clickVisible(timeChoice.element);
+  const dateControlResult = isArcoPickerInput(controls.value.dateField)
+    ? await selectArcoDate(controls.value.dateField, publicationDate)
+    : setPlainScheduleControl(controls.value.dateField, publicationDate);
+  if (!dateControlResult.ok) return dateControlResult;
+  const dateVerified = await waitForStableFormValue(root, /^(?:发布)?日期$/u, "date", publicationDate, dateMatches);
+  if (!dateVerified.value) return failure("定时日期写入后校验不一致或被页面重置。", "schedule_date_unverified", {
+    observedDate: dateVerified.observedValue || ""
+  });
+
+  const currentTimeField = findFormControlByLabel(root, /^(?:发布)?时间$/u, "time") || controls.value.timeField;
+  const timeControlResult = isArcoPickerInput(currentTimeField)
+    ? await selectArcoTime(currentTimeField, publicationTime)
+    : setPlainScheduleControl(currentTimeField, publicationTime);
+  if (!timeControlResult.ok) return timeControlResult;
+  const timeVerified = await waitForStableFormValue(root, /^(?:发布)?时间$/u, "time", publicationTime, timeMatches);
+  if (!timeVerified.value) return failure("定时时间写入后校验不一致或被页面重置。", "schedule_time_unverified", {
+    observedTime: timeVerified.observedValue || ""
+  });
+
+  const pickerClosed = await waitFor(() => (
+    visibleArcoPickerContainers().length === 0 ? { value: true } : false
+  ), Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (!pickerClosed.value) return failure(
+    "日期或时间选择面板仍未关闭，拒绝点击最终发布。",
+    "schedule_picker_still_open"
+  );
+
+  // Re-read every setting as one atomic pre-submit checkpoint.
+  const finalToggle = findLabeledToggle(root, /定时发布/iu);
+  const finalAi = findSelectedAiChoice(findSettingGroup(root, /是否\s*使用\s*AI|使用\s*AI/iu, /(?:^|\s)是(?:\s|$)|(?:^|\s)否(?:\s|$)/u));
+  if (!finalToggle.element || !toggleIsSelected(finalToggle.element) || !finalAi) {
+    return failure("发布设置在最终校验时发生变化，拒绝提交。", "publish_settings_changed");
   }
-  const observedTime = timeField ? readControlValue(timeField) : visiblePageText();
-  if (timeField && !timeMatches(observedTime, publicationTime)) return failure("定时时间写入后校验不一致。", "schedule_time_unverified", { observedTime });
   return { ok: true, publicationDate, publicationTime };
+}
+
+function setPlainScheduleControl(control, value) {
+  setControlValue(control, value);
+  return { ok: true };
+}
+
+function isArcoPickerInput(control) {
+  return Boolean(
+    control instanceof HTMLInputElement &&
+    control.classList.contains("arco-picker-start-time") &&
+    control.closest(".arco-picker")
+  );
+}
+
+function visibleArcoPickerContainers(kind = null) {
+  const selector = kind === "date"
+    ? ".arco-picker-container"
+    : kind === "time"
+      ? ".arco-timepicker-container"
+      : ".arco-picker-container, .arco-timepicker-container";
+  return [...document.querySelectorAll(selector)].filter(isVisible);
+}
+
+function uniqueVisibleArcoPicker(kind) {
+  const candidates = visibleArcoPickerContainers(kind);
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+async function openArcoPicker(control, kind) {
+  clickVisible(control);
+  const opened = await waitFor(() => {
+    const picker = uniqueVisibleArcoPicker(kind);
+    return picker ? { value: picker } : false;
+  }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (!opened.value) return failure(
+    kind === "date" ? "日期选择面板没有打开。" : "时间选择面板没有打开。",
+    kind === "date" ? "schedule_date_picker_missing" : "schedule_time_picker_missing"
+  );
+  return { ok: true, picker: opened.value };
+}
+
+function readArcoCalendarMonth(picker) {
+  if (!picker) return null;
+  const labels = [...picker.querySelectorAll(".arco-picker-header-label")]
+    .map((element) => normalizeCompact(readField(element)));
+  const matched = labels.join("").match(/(20\d{2})年(\d{1,2})月/u);
+  if (!matched) return null;
+  return { year: Number(matched[1]), month: Number(matched[2]) };
+}
+
+function monthIndex(value) {
+  return value.year * 12 + value.month - 1;
+}
+
+function findArcoMonthNavigation(picker, direction) {
+  const iconSelector = direction < 0 ? ".arco-icon-left" : ".arco-icon-right";
+  const icon = picker?.querySelector(iconSelector);
+  return icon?.closest(".arco-picker-header-icon") || null;
+}
+
+async function selectArcoDate(control, expected) {
+  const matched = String(expected || "").match(/^(20\d{2})-(\d{2})-(\d{2})$/u);
+  if (!matched) return failure("计划日期格式无效。", "schedule_date_invalid");
+  const target = { year: Number(matched[1]), month: Number(matched[2]), day: Number(matched[3]) };
+  const opened = await openArcoPicker(control, "date");
+  if (!opened.ok) return opened;
+
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const picker = uniqueVisibleArcoPicker("date");
+    const current = readArcoCalendarMonth(picker);
+    if (!picker || !current) return failure("无法读取日期选择面板的年月。", "schedule_date_calendar_unrecognized");
+    const delta = monthIndex(target) - monthIndex(current);
+    if (delta === 0) {
+      const cells = [...picker.querySelectorAll(".arco-picker-cell-in-view")]
+        .filter(isVisible)
+        .filter((element) => !/(?:^|[\s_-])disabled(?:$|[\s_-])/iu.test(String(element.className || "")))
+        .filter((element) => normalizeCompact(
+          element.querySelector(".arco-picker-date-value")?.textContent || ""
+        ) === String(target.day));
+      if (cells.length !== 1) return failure("日期选择面板中没有唯一的目标日期。", "schedule_date_cell_ambiguous", {
+        expected, candidateCount: cells.length
+      });
+      clickVisible(cells[0]);
+      const committed = await waitFor(() => {
+        const valueMatches = dateMatches(readControlValue(control), expected);
+        const popupClosed = visibleArcoPickerContainers("date").length === 0;
+        return valueMatches && popupClosed ? { value: true } : false;
+      }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+      if (!committed.value) return failure("日期选择后没有被番茄控件确认。", "schedule_date_picker_unverified", {
+        expected, observedDate: readControlValue(control)
+      });
+      return { ok: true };
+    }
+
+    const navigation = findArcoMonthNavigation(picker, delta < 0 ? -1 : 1);
+    if (!navigation || !isVisible(navigation)) return failure("日期选择面板无法切换月份。", "schedule_date_navigation_missing", {
+      expected, current
+    });
+    const previousIndex = monthIndex(current);
+    clickVisible(navigation);
+    const changed = await waitFor(() => {
+      const next = readArcoCalendarMonth(uniqueVisibleArcoPicker("date"));
+      return next && monthIndex(next) !== previousIndex ? { value: next } : false;
+    }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+    if (!changed.value) return failure("日期选择面板切换月份后没有响应。", "schedule_date_navigation_unverified", {
+      expected, current
+    });
+  }
+  return failure("目标发布日期超出可自动选择的月份范围。", "schedule_date_out_of_range", { expected });
+}
+
+function findArcoTimeCell(list, expected) {
+  const cells = [...(list?.querySelectorAll(".arco-timepicker-cell") || [])]
+    .filter(isVisible)
+    .filter((element) => normalizeCompact(
+      element.querySelector(".arco-timepicker-cell-inner")?.textContent || element.textContent || ""
+    ) === expected);
+  return cells.length === 1 ? cells[0] : null;
+}
+
+async function selectArcoTime(control, expected) {
+  const matched = String(expected || "").match(/^([01]\d|2[0-3]):([0-5]\d)$/u);
+  if (!matched) return failure("计划时间格式无效。", "schedule_time_invalid");
+  const opened = await openArcoPicker(control, "time");
+  if (!opened.ok) return opened;
+  const picker = opened.picker;
+  const lists = [...picker.querySelectorAll(".arco-timepicker-list")].filter(isVisible);
+  if (lists.length < 2) return failure("时间选择面板缺少小时或分钟列表。", "schedule_time_picker_unrecognized");
+  const hour = findArcoTimeCell(lists[0], matched[1]);
+  const minute = findArcoTimeCell(lists[1], matched[2]);
+  if (!hour || !minute) return failure("时间选择面板中没有目标小时或分钟。", "schedule_time_cell_missing", {
+    expected
+  });
+
+  // 选小时：点击后等待其进入选中态，确保选择已经生效（Arco 列表可能在选择后重渲染）。
+  if (!/(?:^|[\s_-])selected(?:$|[\s_-])/iu.test(String(hour.className || ""))) {
+    clickVisible(hour);
+    await waitFor(() => /(?:^|[\s_-])selected(?:$|[\s_-])/iu.test(String(hour.className || "")), Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  }
+  // 选分钟：列表可能因滚动重新渲染，按最新引用再查一次并等待选中态。
+  const minuteNow = findArcoTimeCell(lists[1], matched[2]);
+  if (minuteNow && !/(?:^|[\s_-])selected(?:$|[\s_-])/iu.test(String(minuteNow.className || ""))) {
+    clickVisible(minuteNow);
+    await waitFor(() => {
+      const m = findArcoTimeCell(lists[1], matched[2]);
+      return m && /(?:^|[\s_-])selected(?:$|[\s_-])/iu.test(String(m.className || ""));
+    }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  }
+
+  // 点击“确定”提交选择。组件可能在选完后重渲染，故每次都重新查找最新的确定按钮。
+  const commit = async () => {
+    const currentPicker = uniqueVisibleArcoPicker("time") || picker;
+    const confirm = findDialogAction(currentPicker, ["确定"]);
+    if (confirm.element) clickVisible(confirm.element);
+  };
+  await commit();
+  const committed = await waitFor(() => {
+    const valueMatches = timeMatches(readControlValue(control) || control.textContent || "", expected);
+    const popupClosed = visibleArcoPickerContainers("time").length === 0;
+    return valueMatches && popupClosed ? { value: true } : false;
+  }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (committed.value) return { ok: true };
+
+  // 值已写入但弹窗可能仍在动画/未关闭：再尝试关闭一次即可，不必失败。
+  if (timeMatches(readControlValue(control) || control.textContent || "", expected)) {
+    await commit();
+    await waitFor(() => visibleArcoPickerContainers("time").length === 0, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+    return { ok: true };
+  }
+
+  // 值未写入：重渲染后引用可能失效，再点一次“确定”并复核。
+  await commit();
+  const retry = await waitFor(() => {
+    const valueMatches = timeMatches(readControlValue(control) || control.textContent || "", expected);
+    const popupClosed = visibleArcoPickerContainers("time").length === 0;
+    return valueMatches && popupClosed ? { value: true } : false;
+  }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (retry.value) return { ok: true };
+
+  return failure("时间选择后没有被番茄控件确认。", "schedule_time_picker_unverified", {
+    expected, observedTime: readControlValue(control) || control.textContent || ""
+  });
 }
 
 function findWorkRoot(bookName) {
@@ -1340,28 +1911,88 @@ function findWorkRoot(bookName) {
   return candidates[0] || null;
 }
 
+function publicationRootIsHydrated(root) {
+  if (!root) return false;
+  const text = normalizeBody(readField(root));
+  if (text.length > 4000 || !/发布设置/iu.test(text) || !/第\s*\d+\s*章/iu.test(text) ||
+      !/是否\s*使用\s*AI|使用\s*AI/iu.test(text)) return false;
+  const aiGroup = findSettingGroup(root, /是否\s*使用\s*AI|使用\s*AI/iu);
+  const schedule = findLabeledToggle(root, /定时发布/iu);
+  return Boolean(aiGroup && schedule.element);
+}
+
 function findPublicationRoot() {
-  const candidates = [...document.querySelectorAll("[role='dialog'], .modal, .dialog, [class*='modal'], [class*='dialog'], body")]
+  const surface = findDialogSurface(/发布设置/iu);
+  // Arco first mounts a modal shell containing only its title, then hydrates the
+  // chapter and controls. Treating that shell as ready races the React render and
+  // creates a false chapter-context failure. Do not expose the surface until it owns
+  // the chapter context plus the real AI and scheduling controls.
+  if (publicationRootIsHydrated(surface)) return surface;
+  // Test fixtures and older Fanqie builds may use an unlabelled settings container.
+  const candidates = [...document.querySelectorAll("section, article, div")]
     .filter(isVisible)
-    .filter((element) => /发布设置|定时发布|确认发布/iu.test(normalizeBody(readField(element))))
+    .filter(publicationRootIsHydrated)
     .sort((a, b) => readField(a).length - readField(b).length);
   return candidates[0] || null;
 }
 
 function findTypoDialog() {
-  const known = findKnownDialog(/错别字|错字/iu);
-  if (known) return known;
-  // Some Fanqie releases use an unlabelled ByteDance overlay. Accept only the
-  // smallest visible container that has both the exact prompt meaning and its own
-  // Submit button, so page prose containing “错别字” cannot be mistaken for a dialog.
-  const candidates = [...document.querySelectorAll("section, article, div")]
+  return findDialogSurface(/检测到你还有错别字未修改|错别字|错字/iu, {
+    fallbackActionTexts: ["提交", "取消"]
+  });
+}
+
+function findDetectionDialog() {
+  const surface = findDialogSurface(/请选择内容检测方式|内容检测方式|全面检测\s*[（(]?本章节剩余次数/iu, {
+    fallbackActionTexts: ["全面检测", "仅基础检测"]
+  });
+  if (surface) return surface;
+  // Compatibility with older builds that mounted a lone full-check button without a
+  // labelled modal. This is used only after the verified Next transition.
+  const action = findActionButton(["全面检测", "全文检测"]);
+  return action.element ? (action.element.parentElement || document.body) : null;
+}
+
+function findDialogSurface(pattern, { fallbackActionTexts = [] } = {}) {
+  const strong = [...document.querySelectorAll(
+    "[role='dialog'], [aria-modal='true'], .modal, .dialog, [class*='modal'], [class*='dialog']"
+  )]
+    .filter(isVisible)
+    .filter(isDialogSurfaceElement)
+    .filter((element) => pattern.test(normalizeBody(readField(element))))
+    .sort((a, b) => readField(a).length - readField(b).length);
+  if (strong.length) return strong[0];
+
+  // Unlabelled ByteDance overlays: choose the smallest container that owns both the
+  // prompt and at least one expected footer action. This keeps page prose out.
+  const fallback = [...document.querySelectorAll("section, article, div")]
     .filter(isVisible)
     .filter((element) => {
       const text = normalizeBody(readField(element));
-      return text.length <= 1000 && /错别字|错字/iu.test(text) && Boolean(findButtonInRoot(element, ["提交"]).element);
+      if (!text || text.length > 4000 || !pattern.test(text)) return false;
+      return fallbackActionTexts.length === 0 || Boolean(findDialogAction(element, fallbackActionTexts).element);
     })
     .sort((a, b) => readField(a).length - readField(b).length);
-  return candidates[0] || null;
+  return fallback[0] || null;
+}
+
+function isDialogSurfaceElement(element) {
+  if (!element) return false;
+  if (element.getAttribute("role") === "dialog" || element.getAttribute("aria-modal") === "true") return true;
+  const tokens = String(typeof element.className === "string" ? element.className : "").split(/\s+/u).filter(Boolean);
+  return tokens.some((token) => /(?:^|[-_])(?:modal|dialog)$/iu.test(token));
+}
+
+function describeDialogSurface(root) {
+  if (!root) return null;
+  return {
+    element: describeElement(root),
+    text: normalizeBody(readField(root)).slice(0, 1200),
+    actions: [...root.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']")]
+      .filter(isVisible)
+      .map(describeActionElement)
+      .slice(0, 20)
+  };
 }
 
 function findKnownDialog(pattern) {
@@ -1371,6 +2002,14 @@ function findKnownDialog(pattern) {
     .filter(isVisible)
     .filter((element) => pattern.test(normalizeBody(readField(element))));
   return candidates.sort((a, b) => readField(a).length - readField(b).length)[0] || null;
+}
+
+function findRiskControlDialog() {
+  // “风险内容 / 违规内容” are ordinary explanatory words in Fanqie's legitimate
+  // full-content inspection dialog. Only stop on an explicit account/access challenge.
+  return findKnownDialog(
+    /验证码|安全验证|人机验证|行为验证|滑块(?:验证)?|请(?:先)?完成验证|请验证身份|账号异常|操作(?:过于)?频繁|访问(?:受限|异常)|风险控制|captcha/iu
+  );
 }
 
 function findButtonInRoot(root, texts) {
@@ -1575,6 +2214,223 @@ function findStrictNextControl(root = document, { allowDisabled = false } = {}) 
   };
 }
 
+function findDialogAction(root, texts) {
+  if (!root) return { element: null, descriptor: null, candidates: [] };
+  const wanted = texts.map((text) => normalizeCompact(text));
+  const candidates = [];
+  const seen = new Set();
+  const add = (element, source, baseScore) => {
+    if (!element || seen.has(element) || !root.contains(element) || !isVisible(element) || !isActionEnabled(element)) return;
+    const text = actionText(element);
+    const index = wanted.indexOf(text);
+    if (index < 0) return;
+    const descriptor = describeActionElement(element);
+    const rect = descriptor.rect;
+    if (rect.width <= 0 || rect.height <= 0 || rect.width > 480 || rect.height > 160 || rect.width * rect.height > 55_000) return;
+    const marker = `${descriptor.id} ${descriptor.className} ${descriptor.role} ${descriptor.ariaLabel}`;
+    const footer = Boolean(element.closest("footer, [class*='footer'], [class*='action'], [class*='button-group']"));
+    const primary = /primary|confirm|submit|publish|orange|danger/iu.test(marker);
+    seen.add(element);
+    candidates.push({
+      element, descriptor, text, source,
+      score: baseScore - index * 40 + (footer ? 25 : 0) + (primary ? 15 : 0)
+    });
+  };
+
+  for (const element of root.querySelectorAll(
+    "button, [role='button'], a[href], input[type='button'], input[type='submit']"
+  )) add(element, "semantic", 500);
+
+  for (const leaf of root.querySelectorAll("span, div")) {
+    if (!isVisible(leaf) || !wanted.includes(actionText(leaf))) continue;
+    if ([...leaf.children].some((child) => wanted.includes(actionText(child)))) continue;
+    let candidate = leaf.closest("button, [role='button'], a[href], [tabindex]");
+    if (!candidate || !root.contains(candidate)) {
+      candidate = null;
+      let current = leaf;
+      for (let depth = 0; current && current !== root.parentElement && depth < 5; depth += 1, current = current.parentElement) {
+        const marker = `${current.id || ""} ${typeof current.className === "string" ? current.className : ""}`;
+        const pointer = current.style?.cursor === "pointer" || window.getComputedStyle(current).cursor === "pointer";
+        const clickable = typeof current.onclick === "function" || pointer ||
+          /(?:^|[\s_-])(?:arco-)?(?:btn|button|confirm|submit|publish|primary|action)(?:$|[\s_-])/iu.test(marker);
+        if (clickable) { candidate = current; break; }
+        if (current === root) break;
+      }
+    }
+    if (candidate) add(candidate, "custom", 400);
+  }
+
+  candidates.sort((a, b) => b.score - a.score || b.descriptor.rect.bottom - a.descriptor.rect.bottom ||
+    b.descriptor.rect.right - a.descriptor.rect.right);
+  return {
+    element: candidates[0]?.element || null,
+    descriptor: candidates[0]?.descriptor || null,
+    candidates: candidates.slice(0, 12).map((item) => ({ ...item.descriptor, source: item.source, score: item.score }))
+  };
+}
+
+function findSettingGroup(root, labelPattern) {
+  if (!root) return null;
+  const candidates = [root, ...root.querySelectorAll("fieldset, section, article, li, tr, label, [class*='item'], [class*='row'], div")]
+    .filter(isVisible)
+    .filter((element) => {
+      const text = normalizeBody(readField(element));
+      return text.length <= 1600 && labelPattern.test(text) &&
+        (Boolean(findAiChoice(element, "yes").element) || Boolean(findAiChoice(element, "no").element));
+    })
+    .sort((a, b) => readField(a).length - readField(b).length);
+  return candidates[0] || null;
+}
+
+function choiceText(element) {
+  if (!element) return "";
+  const label = element instanceof HTMLInputElement
+    ? (element.closest("label") || (element.id ? document.querySelector(`label[for='${cssEscape(element.id)}']`) : null))
+    : null;
+  return normalizeCompact(
+    label?.innerText || element.innerText || element.textContent || element.getAttribute("aria-label") || element.getAttribute("value") || ""
+  );
+}
+
+function findAiChoice(root, kind) {
+  if (!root) return { element: null, clickTarget: null, text: "", kind };
+  const candidates = [...root.querySelectorAll(
+    "label, [role='radio'], input[type='radio'], [class*='radio']"
+  )]
+    .map((element) => {
+      const clickTarget = element instanceof HTMLInputElement
+        ? (element.closest("label") || element.closest("[role='radio']") || element)
+        : element;
+      const text = choiceText(element);
+      return { element, clickTarget, text, kind };
+    })
+    .filter((item) => isVisible(item.clickTarget))
+    .filter((item) => kind === "yes"
+      ? /^(?:是|使用AI|使用)$/iu.test(item.text)
+      : /^(?:否|不使用AI|未使用AI|不使用)$/iu.test(item.text))
+    .sort((a, b) => {
+      const aInput = a.element instanceof HTMLInputElement ? 0 : 1;
+      const bInput = b.element instanceof HTMLInputElement ? 0 : 1;
+      return aInput - bInput || readField(a.clickTarget).length - readField(b.clickTarget).length;
+    });
+  return candidates[0] || { element: null, clickTarget: null, text: "", kind };
+}
+
+function findSelectedAiChoice(root) {
+  if (!root) return null;
+  for (const kind of ["yes", "no"]) {
+    const choice = findAiChoice(root, kind);
+    if (choice.element && (elementIsSelected(choice.element) || elementIsSelected(choice.clickTarget))) return choice;
+  }
+  return null;
+}
+
+function findLabeledToggle(root, pattern) {
+  if (!root) return { element: null, clickTarget: null };
+  const controls = [...root.querySelectorAll(
+    "[role='switch'], [role='radio'], input[type='checkbox'], button[class*='switch'], [class*='switch']"
+  )];
+  const candidates = [];
+  const seen = new Set();
+  for (const element of controls) {
+    const control = element.matches("[role='switch'], [role='radio'], input[type='checkbox'], button")
+      ? element
+      : (element.querySelector("[role='switch'], input[type='checkbox'], button") || element);
+    if (seen.has(control)) continue;
+    const clickTarget = control instanceof HTMLInputElement
+      ? (control.closest("label") || control.closest("[class*='switch']") || control)
+      : control;
+    if (!isVisible(clickTarget)) continue;
+    let current = clickTarget;
+    let groupText = "";
+    for (let depth = 0; current && root.contains(current) && depth < 7; depth += 1, current = current.parentElement) {
+      const text = normalizeBody(readField(current));
+      if (pattern.test(text)) { groupText = text; break; }
+      if (current === root) break;
+    }
+    if (!groupText) continue;
+    seen.add(control);
+    candidates.push({ element: control, clickTarget, groupText });
+  }
+  candidates.sort((a, b) => a.groupText.length - b.groupText.length);
+  return candidates[0] || { element: null, clickTarget: null };
+}
+
+function toggleIsSelected(element) {
+  if (!element) return false;
+  if (element.checked === true || element.getAttribute("aria-checked") === "true") return true;
+  const className = `${typeof element.className === "string" ? element.className : ""} ${typeof element.parentElement?.className === "string" ? element.parentElement.className : ""}`;
+  return /(?:^|[\s_-])(?:checked|selected|active|on)(?:$|[\s_-])/iu.test(className);
+}
+
+function findFormControlByLabel(root, labelPattern, type) {
+  if (!root) return null;
+  const controlSelector = type === "date"
+    ? "input[type='date'], input[placeholder*='日期'], input[aria-label*='日期'], input[name*='date'], input[class*='date'], input[type='text']"
+    : "input[type='time'], input[placeholder*='时间'], input[aria-label*='时间'], input[name*='time'], input[class*='time'], select, input[type='text']";
+  const labels = [...root.querySelectorAll("label, span, p, div")]
+    .filter(isVisible)
+    .filter((element) => {
+      const directText = normalizeCompact([...element.childNodes]
+        .filter((node) => node.nodeType === Node.TEXT_NODE)
+        .map((node) => node.textContent || "")
+        .join(" "));
+      return labelPattern.test(directText || normalizeCompact(readField(element)));
+    })
+    .filter((element) => ![...element.children].some((child) => labelPattern.test(normalizeCompact(readField(child)))));
+  const candidates = [];
+  for (const label of labels) {
+    let current = label.parentElement;
+    for (let depth = 0; current && root.contains(current) && depth < 7; depth += 1, current = current.parentElement) {
+      const controls = [...current.querySelectorAll(controlSelector)].filter(isVisible);
+      if (controls.length === 1) {
+        candidates.push({ control: controls[0], groupLength: readField(current).length, depth });
+        break;
+      }
+      if (current === root) break;
+    }
+  }
+  if (candidates.length) {
+    candidates.sort((a, b) => a.depth - b.depth || a.groupLength - b.groupLength);
+    return candidates[0].control;
+  }
+  const attributed = [...root.querySelectorAll(controlSelector)]
+    .filter(isVisible)
+    .find((control) => labelPattern.test(normalizeCompact(
+      `${control.getAttribute("aria-label") || ""}${control.getAttribute("placeholder") || ""}${control.getAttribute("name") || ""}`
+    )));
+  return attributed || null;
+}
+
+async function waitForStableFormValue(root, labelPattern, type, expected, matcher, stableMs = 800) {
+  const deadline = Date.now() + SETTINGS_CONTROL_TIMEOUT_MS;
+  let stableSince = 0;
+  let stableControl = null;
+  let observedValue = "";
+  while (Date.now() < deadline) {
+    const control = findFormControlByLabel(root, labelPattern, type);
+    observedValue = control ? readControlValue(control) : "";
+    if (control?.isConnected && matcher(observedValue, expected)) {
+      if (stableControl !== control) {
+        stableControl = control;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince >= stableMs) {
+        return { value: control, observedValue, stabilityMs: Date.now() - stableSince };
+      }
+    } else {
+      stableControl = null;
+      stableSince = 0;
+    }
+    await sleep(AUTOMATION_LIMITS.pollMs);
+  }
+  return { value: false, observedValue };
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return window.CSS.escape(String(value));
+  return String(value).replace(/["'\\]/gu, "\\$&");
+}
+
 function findActionButton(texts, root = document) {
   const wanted = texts.map((text) => normalizeCompact(text));
   const candidates = [...root.querySelectorAll("button, [role='button'], a, input[type='button'], input[type='submit']")]
@@ -1618,7 +2474,11 @@ function findSelectedChoice(root, pattern) {
 }
 
 function elementIsSelected(element) {
-  return Boolean(element.checked || element.getAttribute("aria-checked") === "true" || element.classList.contains("selected") || element.classList.contains("active"));
+  if (!element) return false;
+  if (element.checked === true || element.getAttribute("aria-checked") === "true") return true;
+  if (element.querySelector?.(":checked, [aria-checked='true']")) return true;
+  const marker = `${typeof element.className === "string" ? element.className : ""} ${typeof element.parentElement?.className === "string" ? element.parentElement.className : ""}`;
+  return /(?:^|[\s_-])(?:checked|selected|active)(?:$|[\s_-])/iu.test(marker);
 }
 
 function findLabeledControl(root, pattern, type) {
@@ -1635,6 +2495,7 @@ function findLabeledControl(root, pattern, type) {
 }
 
 function setControlValue(control, value) {
+  control.focus();
   if (control.tagName === "SELECT") {
     const option = [...control.options].find((item) => item.value === value || item.textContent.trim() === value);
     if (!option) throw new Error(`未找到选项:${value}`);
@@ -1645,11 +2506,15 @@ function setControlValue(control, value) {
     if (!descriptor?.set) throw new Error("定时控件不可写");
     descriptor.set.call(control, value);
   }
+  try {
+    control.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, inputType: "insertText", data: String(value) }));
+  } catch (_error) { /* older Chromium: the plain input event below is sufficient */ }
   control.dispatchEvent(new Event("input", { bubbles: true }));
   control.dispatchEvent(new Event("change", { bubbles: true }));
-  control.dispatchEvent(new Event("blur", { bubbles: true }));
+  control.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+  control.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
+  control.blur();
 }
-
 function readControlValue(control) {
   return control.value || control.getAttribute("value") || "";
 }

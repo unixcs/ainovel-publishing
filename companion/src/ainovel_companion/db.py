@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -32,6 +33,8 @@ EVENT_STATUS = {
     "plan_approved": "planned",
     "final_submit_armed": "submitted",
     "schedule_submitted": "submitted",
+    "submission_rejected": "blocked",
+    "schedule_rescheduled": "scheduled",
     "schedule_verified": "scheduled",
     "awaiting_ai_choice": "awaiting_ai_choice",
     # Observation events prove that a platform row exists, but deliberately do not
@@ -62,6 +65,7 @@ FINAL_SUBMISSION_CHECKPOINTS = {
     "final_submit_armed",
     "final_submit_clicked",
     "schedule_submitted",
+    "schedule_rescheduled",
     "schedule_verified",
     "published",
     "verified",
@@ -72,6 +76,45 @@ RECOVERABLE_CHECKPOINTS = {
     "next_clicked",
     "awaiting_ai_choice",
 }
+
+_CHAPTER_TITLE_PREFIX = re.compile(
+    r"^第\s*[〇零一二三四五六七八九十百千万两\d]+\s*章[\s:：、.．-]*",
+    re.UNICODE,
+)
+_CHINESE_DIGITS = "零一二三四五六七八九"
+
+
+def fanqie_title_base(title: str) -> str:
+    """Return the title text Fanqie's separate chapter-number field does not own."""
+    return _CHAPTER_TITLE_PREFIX.sub("", str(title or "")).strip()
+
+
+def _chinese_ordinal(value: int) -> str:
+    if value < 10:
+        return _CHINESE_DIGITS[value]
+    if value == 10:
+        return "十"
+    if value < 20:
+        return f"十{_CHINESE_DIGITS[value % 10]}"
+    if value < 100:
+        tail = "" if value % 10 == 0 else _CHINESE_DIGITS[value % 10]
+        return f"{_CHINESE_DIGITS[value // 10]}十{tail}"
+    return str(value)
+
+
+def fanqie_platform_title(title: str, earlier_titles: list[str]) -> str:
+    """Make a stable, minimally changed title when Fanqie forbids duplicates.
+
+    The source manuscript remains untouched. Only the second and later occurrence gets
+    a suffix, so ``晨钟`` becomes ``晨钟（二）`` and the first published title stays as-is.
+    """
+    base = fanqie_title_base(title)
+    key = "".join(base.split())
+    occurrence = 1 + sum(
+        1 for previous in earlier_titles
+        if "".join(fanqie_title_base(previous).split()) == key
+    )
+    return base if occurrence == 1 else f"{base}（{_chinese_ordinal(occurrence)}）"
 
 
 def utc_now() -> str:
@@ -359,7 +402,18 @@ class PublishingDB:
                 "SELECT * FROM chapters WHERE book_id=? AND chapter_no=?",
                 (book_id, chapter_no),
             ).fetchone()
-            return dict(row) if row else None
+            if row is None:
+                return None
+            earlier_titles = [
+                str(item["title"])
+                for item in conn.execute(
+                    "SELECT title FROM chapters WHERE book_id=? AND chapter_no<? ORDER BY chapter_no",
+                    (book_id, chapter_no),
+                ).fetchall()
+            ]
+            result = dict(row)
+            result["platform_title"] = fanqie_platform_title(result["title"], earlier_titles)
+            return result
 
     @staticmethod
     def _recovery_state_from_rows(
@@ -556,7 +610,7 @@ class PublishingDB:
                 FROM events e
                 WHERE e.book_id=? AND e.event_type IN (
                     'schedule_observed', 'published_observed',
-                    'schedule_verified', 'published', 'verified'
+                    'schedule_rescheduled', 'schedule_verified', 'published', 'verified'
                 )
                 ORDER BY e.chapter_no, e.id
                 """,
@@ -573,7 +627,7 @@ class PublishingDB:
                     row["event_type"] not in {"schedule_observed", "published_observed"},
                 )
             )
-            if row["event_type"] in {"schedule_observed", "schedule_verified"}:
+            if row["event_type"] in {"schedule_observed", "schedule_rescheduled", "schedule_verified"}:
                 platform_state = "scheduled"
             else:
                 platform_state = "published"
@@ -829,10 +883,10 @@ class PublishingDB:
             new_status = mapped_status or chapter["status"]
             platform_state = payload.get("platform_state", chapter["platform_state"])
             platform_chapter_id = payload.get("platform_chapter_id", chapter["platform_chapter_id"])
-            verified_at = now if event_type in {"saved_draft", "published", "verified", "reconcile_match", "schedule_verified"} else chapter["verified_at"]
-            if event_type in {"failed", "blocked"}:
+            verified_at = now if event_type in {"saved_draft", "published", "verified", "reconcile_match", "schedule_rescheduled", "schedule_verified"} else chapter["verified_at"]
+            if event_type in {"failed", "blocked", "submission_rejected"}:
                 last_error = payload.get("error") or event_type
-            elif event_type in {"resumed", "schedule_verified", "published", "verified", "reconcile_match"}:
+            elif event_type in {"resumed", "schedule_rescheduled", "schedule_verified", "published", "verified", "reconcile_match"}:
                 last_error = None
             else:
                 last_error = chapter["last_error"]
@@ -858,6 +912,8 @@ class PublishingDB:
                     "plan_approved": "planned",
                     "final_submit_armed": "submitted",
                     "schedule_submitted": "submitted",
+                    "submission_rejected": "blocked",
+                    "schedule_rescheduled": "scheduled",
                     "schedule_verified": "scheduled",
                     "awaiting_ai_choice": "awaiting_ai_choice",
                     "published": "published",

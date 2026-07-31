@@ -19,7 +19,7 @@ def test_count_removes_whitespace():
     assert quota_units_from_text("甲\n乙  丙") == 3
 
 
-def test_default_slot_and_one_chapter_per_day():
+def test_default_slot_advances_when_two_chapters_exceed_daily_limit():
     plan = build_publication_plan(
         [chapter(6, 6000), chapter(7, 8000)],
         start_date=date(2026, 7, 23),
@@ -30,7 +30,41 @@ def test_default_slot_and_one_chapter_per_day():
     ]
 
 
-def test_existing_schedule_is_adopted_and_not_duplicated():
+def test_consecutive_chapters_share_a_day_when_combined_quota_fits():
+    plan = build_publication_plan(
+        [chapter(8, 4544), chapter(9, 4675), chapter(10, 4531), chapter(11, 3923)],
+        start_date=date(2026, 7, 25),
+    )
+    assert [(item.chapter_no, item.publication_date) for item in plan] == [
+        (8, "2026-07-25"),
+        (9, "2026-07-25"),
+        (10, "2026-07-26"),
+        (11, "2026-07-26"),
+    ]
+    assert sum(item.quota_units for item in plan if item.publication_date == "2026-07-25") == 9219
+    assert sum(item.quota_units for item in plan if item.publication_date == "2026-07-26") == 8454
+
+
+def test_existing_schedule_keeps_room_for_next_chapter_on_same_day():
+    # 复现用户反馈：第40章已定时到8月12日(4700字)，第41章约4000字，
+    # 两章合计8700 < 9999，应都能排到8月12日，而不应把第41章推到8月13日。
+    plan = build_publication_plan(
+        [chapter(41, 4000)],
+        existing_schedules=[{
+            "chapter_no": 40,
+            "text_sha256": "4" * 64,
+            "publication_date": "2026-08-12",
+            "publication_time": "20:00",
+            "quota_units": 4700,
+        }],
+        start_date=date(2026, 8, 12),
+    )
+    assert plan[0].chapter_no == 41
+    assert plan[0].publication_date == "2026-08-12"
+    assert plan[0].status == "planned"
+
+
+def test_existing_schedule_is_adopted_and_remaining_daily_quota_is_reused():
     plan = build_publication_plan(
         [chapter(4, 6000), chapter(6, 3000)],
         existing_schedules=[{
@@ -43,7 +77,7 @@ def test_existing_schedule_is_adopted_and_not_duplicated():
         start_date=date(2026, 7, 23),
     )
     assert plan[0].status == "adopted"
-    assert plan[1].publication_date == "2026-07-24"
+    assert plan[1].publication_date == "2026-07-23"
 
 
 def test_existing_schedule_version_conflict_blocks():

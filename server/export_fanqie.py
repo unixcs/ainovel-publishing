@@ -22,6 +22,9 @@ STABLE_POLLS = 2
 STABLE_INTERVAL = 1
 STABLE_MIN_AGE_SECONDS = 10
 MAX_TITLE_LEN = 80
+PLAIN_CHAPTER_TITLE = re.compile(
+    r"^第\s*(?:\d+|[零〇一二三四五六七八九十百千两]+)\s*章(?:\s+|[：:]\s*)\S.{0,60}$"
+)
 
 
 def utc_now() -> str:
@@ -68,14 +71,25 @@ def clean_line(line: str) -> str:
 
 
 def parse_markdown_chapter(path: Path, fallback_title: str) -> tuple[str, str]:
-    raw = path.read_text(encoding='utf-8').splitlines()
+    raw = path.read_text(encoding='utf-8').lstrip('\ufeff').splitlines()
     title = None
     body: list[str] = []
-    for i, line in enumerate(raw):
+    first_content_seen = False
+    for line in raw:
         s = line.strip()
-        if i == 0 and s.startswith('#'):
-            title = re.sub(r'^#{1,6}\s+', '', s)
+        if not first_content_seen and not s:
             continue
+        if not first_content_seen:
+            first_content_seen = True
+            if s.startswith('#'):
+                title = clean_line(re.sub(r'^#{1,6}\s+', '', s)).strip()
+                continue
+            # Some Ainovel chapters use a plain first-line heading instead of Markdown.
+            # Promote only a short, explicit “第…章 + title” line; ordinary prose stays body.
+            plain_title = clean_line(s).strip()
+            if PLAIN_CHAPTER_TITLE.fullmatch(plain_title):
+                title = plain_title
+                continue
         if s.startswith('#'):
             body.append(clean_line(re.sub(r'^#{1,6}\s+', '', s)))
             continue
