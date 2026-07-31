@@ -15,7 +15,7 @@ const BOOK_MANAGE_URL = "https://fanqienovel.com/main/writer/book-manage";
 const AUTOMATION_ALARM = "ainovel-publication-runner";
 const AUTOMATION_SAFETY_EPOCH = "0.3.7-packed-quota-and-unique-titles";
 const PLATFORM_PREFLIGHT_TTL_MS = 2 * 60 * 1000;
-const PAGE_ADAPTER_VERSION = "0.3.7";
+const PAGE_ADAPTER_VERSION = "0.3.6";
 let automationLock = false;
 const safetyReady = enforceAutomationSafetyEpoch();
 

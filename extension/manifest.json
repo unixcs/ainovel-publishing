@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ainovel 番茄发布助手",
-  "version": "0.3.8",
+  "version": "0.3.6",
   "description": "从本地 Ainovel Companion 获取章节，一键续接或新建章节，并按额度验证定时发布。",
   "permissions": [
     "sidePanel",

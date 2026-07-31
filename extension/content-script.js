@@ -1,6 +1,6 @@
 "use strict";
 
-const PAGE_ADAPTER_VERSION = "0.3.7";
+const PAGE_ADAPTER_VERSION = "0.3.6";
 
 // Selector strategy adapted from NonoOi/fanqie-author-injector (MIT); see THIRD_PARTY_NOTICES.md.
 const FIELD_SELECTORS = {
