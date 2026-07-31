@@ -1866,35 +1866,45 @@ async function selectArcoTime(control, expected) {
     }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
   }
 
-  // 点击“确定”提交选择。组件可能在选完后重渲染，故每次都重新查找最新的确定按钮。
-  const commit = async () => {
-    const currentPicker = uniqueVisibleArcoPicker("time") || picker;
-    const confirm = findDialogAction(currentPicker, ["确定"]);
-    if (confirm.element) clickVisible(confirm.element);
+  // 提交并关闭面板。Arco 时间选择器（“TimePicker”）在不同情况下行为不同：
+  //  - 多数情况面板内有“确定”按钮，点击即提交并关闭；
+  //  - 但重渲染后原“确定”按钮引用可能失效，需在最新面板或整个弹窗内重新定位；
+  //  - 少数情况下面板根本没有“确定”按钮（选中即生效），只能靠点击面板外或按 Esc 关闭。
+  // 下面三种方式都尝试，确保时间写回且面板关闭，修复“时间选择后没有被最新控件确认”导致的停滞。
+  const valueConfirmed = () => timeMatches(readControlValue(control) || control.textContent || "", expected);
+  const pickerClosed = () => visibleArcoPickerContainers("time").length === 0;
+
+  const dismissTimePicker = () => {
+    // 1) 优先点击“确定”：先在最新面板内找，找不到再到整个模态内找（覆盖重渲染后引用失效）。
+    const pickerNow = uniqueVisibleArcoPicker("time") || picker;
+    let confirm = findDialogAction(pickerNow, ["确定"]).element;
+    if (!confirm) {
+      const modal = control.closest(".arco-modal, [role='dialog']");
+      if (modal) confirm = findDialogAction(modal, ["确定"]).element;
+    }
+    if (confirm && isVisible(confirm) && isActionEnabled(confirm)) clickVisible(confirm);
+    // 2) 面板仍未关闭：在模态内部点击一个中性区域（标题栏）或 body，触发“点击外部关闭”。
+    //    注意绝不点击遮罩层，否则会关掉整个发布设置弹窗。
+    if (!pickerClosed()) {
+      const modal = control.closest(".arco-modal, [role='dialog']");
+      const neutral = (modal && modal.querySelector(
+        ".arco-modal-header, .arco-modal-title, header, [class*='modal-title'], [class*='dialog-title']"
+      )) || document.body;
+      neutral.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      neutral.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      // 3) 最后兜底：按 Esc 让 Arco 自行关闭时间面板。
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, which: 27, bubbles: true }));
+    }
   };
-  await commit();
-  const committed = await waitFor(() => {
-    const valueMatches = timeMatches(readControlValue(control) || control.textContent || "", expected);
-    const popupClosed = visibleArcoPickerContainers("time").length === 0;
-    return valueMatches && popupClosed ? { value: true } : false;
-  }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
-  if (committed.value) return { ok: true };
 
-  // 值已写入但弹窗可能仍在动画/未关闭：再尝试关闭一次即可，不必失败。
-  if (timeMatches(readControlValue(control) || control.textContent || "", expected)) {
-    await commit();
-    await waitFor(() => visibleArcoPickerContainers("time").length === 0, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
-    return { ok: true };
-  }
+  dismissTimePicker();
+  let ok = await waitFor(() => (valueConfirmed() && pickerClosed()) ? { value: true } : false, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (ok.value) return { ok: true };
 
-  // 值未写入：重渲染后引用可能失效，再点一次“确定”并复核。
-  await commit();
-  const retry = await waitFor(() => {
-    const valueMatches = timeMatches(readControlValue(control) || control.textContent || "", expected);
-    const popupClosed = visibleArcoPickerContainers("time").length === 0;
-    return valueMatches && popupClosed ? { value: true } : false;
-  }, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
-  if (retry.value) return { ok: true };
+  // 仍无效再尝试一轮，覆盖面板动画/重渲染时序。
+  dismissTimePicker();
+  ok = await waitFor(() => (valueConfirmed() && pickerClosed()) ? { value: true } : false, Date.now() + SETTINGS_CONTROL_TIMEOUT_MS);
+  if (ok.value) return { ok: true };
 
   return failure("时间选择后没有被番茄控件确认。", "schedule_time_picker_unverified", {
     expected, observedTime: readControlValue(control) || control.textContent || ""
